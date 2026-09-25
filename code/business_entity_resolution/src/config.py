@@ -8,6 +8,8 @@ Every module imports its paths from here; nothing else hard-codes a path.
 * ``INTERIM_DIR`` ``<repo_root>/data/interim``.
 * ``OUTPUT_DIR``  ``<repo_root>/output``.
 * ``SEED``        42.
+* ``REPORTS_DIR`` ``<repo_root>/reports``; ``FAKE_DATA_DIR`` ``<repo_root>/dataset_fake``;
+  ``SAMPLE_DIR`` ``<repo_root>/dataset_sample`` (generated, git-ignored).
 """
 from __future__ import annotations
 
@@ -62,6 +64,9 @@ TRAIN_DIR = DATA_DIR / "train"
 TEST_DIR = DATA_DIR / "test"
 INTERIM_DIR = REPO_ROOT / "data" / "interim"
 OUTPUT_DIR = REPO_ROOT / "output"
+REPORTS_DIR = REPO_ROOT / "reports"
+FAKE_DATA_DIR = REPO_ROOT / "dataset_fake"
+SAMPLE_DIR = REPO_ROOT / "dataset_sample"
 
 
 def split_dir(split: str) -> Path:

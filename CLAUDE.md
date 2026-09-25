@@ -101,6 +101,7 @@ Goals for this phase:
 - [ ] src/write_submission.py: writes both TSVs per the rules; asserts matches are a subset of candidates
 - [ ] docs/contracts.md with the schemas above
 - [ ] Stub versions of every pipeline stage + run_all.sh that runs end to end and then the validator
-- [ ] A fake mini dataset generator (US/India/France records in the exact TSV format) to test the whole pipeline
+- [x] A fake mini dataset generator (US/India/France records in the exact TSV format) to test the whole pipeline: `python -m src.make_fake_data` -> dataset_fake/
+- [x] Streaming tools for the full data (run on SageMaker with ER_DATA_DIR): `python -m src.profile_data` -> reports/data_profile.md; `python -m src.make_sample` -> dataset_sample/
 - [ ] Script to write an all-empty submission (for the singleton-rate probe)
 When the real dataset arrives, the next phase starts with notebooks/eda_assumptions.py.

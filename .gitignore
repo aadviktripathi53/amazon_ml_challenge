@@ -221,6 +221,9 @@ __marimo__/
 dataset/
 data/
 output/
+dataset_fake/
+dataset_sample*/
+reports/*_fake.md
 
 # Environment
 *.pem
