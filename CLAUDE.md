@@ -20,8 +20,10 @@ word-order swaps, landmark addresses ("Near SBI ATM"), missing pincodes, transli
 - Final models must be MIT or Apache 2.0 licensed and at most 8B parameters. Check the license before using any pretrained model.
 - Train data has US and India only; TEST ALSO HAS FRANCE. Treat country as an open set of strings.
   Never hard-code, filter, or one-hot countries to {US, India}. Prefer language-agnostic features.
-- All files are tab-separated. Always read with:
-  pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+- All files are tab-separated. Always read with `src.io_utils.read_tsv` / `src.streaming.iter_chunks`, i.e.:
+  pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, quoting=csv.QUOTE_NONE)
+  (QUOTE_NONE matters: with default quoting a field that starts with `"` swallows the following rows and their IDs.
+  Cross-check parsed rows against physical lines; `python -m src.profile_data` reports any mismatch.)
 - Never modify anything in dataset/. Never commit dataset/ or output/ to git.
 
 ## Required outputs (in output/)

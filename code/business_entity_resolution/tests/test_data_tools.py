@@ -203,3 +203,114 @@ def test_verification_detects_corruption(fake, tmp_path):
     assert not run(bad_prefix)["id prefixes match their files"]
     assert not run(duplicate)["no duplicate entity_ids"]
     assert all(run(lambda o: None).values())
+
+
+# ---------------------------------------------------------------- existence-check regressions
+HDR = "entity_id\tbusiness_name\tbusiness_address\tcountry\n"
+
+
+def write_dataset(root: Path, s1_names=None, n=7, gt_rows=None, source_ids=None) -> Path:
+    """Write a tiny train dataset: n rows per source, ids S{k}-1..n, GT S1-i -> S2-i,S3-i (all overridable)."""
+    d = root / "train"
+    d.mkdir(parents=True)
+    for k in (1, 2, 3):
+        ids = (source_ids or {}).get(k, [f"S{k}-{i}" for i in range(1, n + 1)])
+        names = s1_names if (k == 1 and s1_names) else [f"Name {i}" for i in range(len(ids))]
+        (d / f"train_source{k}.tsv").write_text(HDR + "".join(f"{i}\t{nm}\t1 Main St\tUS\n" for i, nm in zip(ids, names)))
+    rows = gt_rows or [f"S1-{i}\tS2-{i},S3-{i}" for i in range(1, n + 1)]
+    (d / "train_ground_truth.tsv").write_text("source1_entity_id\tmatched_entity_ids\n" + "".join(r + "\n" for r in rows))
+    return root
+
+
+@pytest.mark.parametrize("chunksize", [1, 2, 3, 4, 200_000])
+def test_existence_check_across_chunk_boundaries(tmp_path, monkeypatch, chunksize):
+    """IDs on the last row of one chunk / first row of the next are found (7 rows, chunks of 3: rows 3|4)."""
+    monkeypatch.setattr(streaming, "CHUNKSIZE", chunksize)
+    root = write_dataset(tmp_path, n=7)
+    res = profile_data.profile(root)
+    t = res["truth"]
+    assert t["missing"] == {"S1": 0, "S2": 0, "S3": 0} and t["missing_distinct"] == {"S1": 0, "S2": 0, "S3": 0}
+    assert t["s1_without_gt"] == 0 and profile_data.integrity_warnings(res) == []
+    assert "YES" in profile_data.render_markdown(res)
+
+
+def test_existence_check_boundary_ids_only_present_in_boundary_rows(tmp_path, monkeypatch):
+    """A real gap next to a chunk boundary is still reported exactly (no over- or under-counting)."""
+    monkeypatch.setattr(streaming, "CHUNKSIZE", 3)
+    # GT references S2-3 (last row of chunk 1) and S2-4 (first of chunk 2); the S2 file lacks S2-4 only.
+    ids = {2: ["S2-1", "S2-2", "S2-3", "S2-5", "S2-6", "S2-7"]}
+    t = profile_data.profile(write_dataset(tmp_path, n=7, source_ids=ids))["truth"]
+    assert t["missing"]["S2"] == 1 and t["missing_examples"]["S2"] == ["S2-4"]
+    assert t["missing"]["S1"] == 0 and t["missing"]["S3"] == 0
+
+
+def test_stray_leading_quote_does_not_drop_rows(tmp_path):
+    """A name starting with an unclosed `"` used to swallow following rows -> IDs falsely 'missing'."""
+    names = ["Alpha Ltd", "Beta Inc", '"Gamma Traders', "Delta Co", 'Epsilon" Sons', "Zeta LLC", "Eta Corp", "Theta Ltd"]
+    root = write_dataset(tmp_path, s1_names=names, n=8)
+    src = root / "train" / "train_source1.tsv"
+    assert len(pd.read_csv(src, sep="\t", dtype=str, keep_default_na=False)) < 8  # the failure mode: default quoting loses rows
+    assert len(read_tsv(src)) == 8  # our reader keeps them
+    res = profile_data.profile(root)
+    assert res["scans"][src].rows == 8 and res["truth"]["missing"]["S1"] == 0
+    assert profile_data.integrity_warnings(res) == []
+
+
+def test_parsed_vs_raw_line_mismatch_is_flagged(tmp_path):
+    """If the parser ever loses rows again, the report says so explicitly."""
+    res = profile_data.profile(write_dataset(tmp_path, n=4))
+    src = tmp_path / "train" / "train_source2.tsv"
+    res["raw"][src] = (9, 3)  # pretend the file has 9 lines
+    warns = profile_data.integrity_warnings(res)
+    assert len(warns) == 1 and "train_source2.tsv" in warns[0] and "9" in warns[0]
+    assert "MISMATCH" in profile_data.render_markdown(res)
+
+
+def test_raw_line_stats(tmp_path):
+    """Header excluded; last line counted even without trailing newline; quotes counted."""
+    p = tmp_path / "f.tsv"
+    p.write_text('h\n"a\nb"\nc')
+    assert streaming.raw_line_stats(p) == (3, 2)
+    p.write_text("h\na\nb\n")
+    assert streaming.raw_line_stats(p) == (2, 0)
+    p.write_text("h\n")
+    assert streaming.raw_line_stats(p) == (0, 0)
+
+
+def test_whitespace_in_ids_is_not_a_false_missing_but_is_flagged(tmp_path):
+    """IDs differing only by surrounding whitespace match; the report warns about the whitespace."""
+    ids = {2: [f"S2-{i} " if i == 2 else f"S2-{i}" for i in range(1, 6)]}
+    res = profile_data.profile(write_dataset(tmp_path, n=5, source_ids=ids, gt_rows=[f"S1-{i}\tS2-{i}, S3-{i}" for i in range(1, 6)]))
+    t = res["truth"]
+    assert t["missing"] == {"S1": 0, "S2": 0, "S3": 0}
+    assert any("whitespace" in w for w in profile_data.integrity_warnings(res))
+
+
+def test_missing_reports_mentions_and_distinct(tmp_path):
+    """The same dangling id in two GT rows = 2 mentions but 1 distinct id."""
+    rows = ["S1-1\tS2-1,S3-1", "S1-2\tS2-99,S3-2", "S1-3\tS2-99,S3-3"]
+    t = profile_data.profile(write_dataset(tmp_path, n=3, gt_rows=rows))["truth"]
+    assert t["missing"]["S2"] == 2 and t["missing_distinct"]["S2"] == 1 and t["shared_match_ids"] == 1
+
+
+def test_gt_s1_ids_beyond_source1_are_reported_as_distinct_anomaly(tmp_path):
+    """GT rows for S1 ids that are not in train_source1 are counted as distinct missing S1 ids."""
+    rows = [f"S1-{i}\tS2-{i},S3-{i}" for i in range(1, 4)] + ["S1-77\t", "S1-78\t"]
+    res = profile_data.profile(write_dataset(tmp_path, n=3, gt_rows=rows))
+    t = res["truth"]
+    assert t["rows"] == 5 and t["distinct_gt_s1"] == 5 and t["missing_distinct"]["S1"] == 2
+    assert "distinct ground-truth S1 IDs absent from train_source1.tsv: 2" in profile_data.render_markdown(res)
+
+
+def test_make_sample_preserves_stray_quotes_byte_for_byte(tmp_path):
+    """Sampling a file containing stray quotes neither drops rows nor re-quotes them."""
+    names = ["Alpha Ltd", "Beta Inc", '"Gamma Traders', "Delta Co", 'Epsilon" Sons', "Zeta LLC", "Eta Corp", "Theta Ltd"]
+    root = write_dataset(tmp_path / "src", s1_names=names, n=8)
+    (root / "test").mkdir()
+    for k in (1, 2, 3):
+        (root / "test" / f"test_source{k}.tsv").write_text(HDR + f"S{k}-1\t\"Q Name\tAddr\tFrance\n")
+    out = tmp_path / "out"
+    make_sample.make_sample(root, out, n_s1=8, distractor_ratio=1, test_frac=1.0, seed=1)
+    got = (out / "train" / "train_source1.tsv").read_text().splitlines()
+    assert len(got) == 9 and any('"Gamma Traders' in line for line in got) and not any('""' in line for line in got)
+    assert (out / "test" / "test_source1.tsv").read_text() == (root / "test" / "test_source1.tsv").read_text()

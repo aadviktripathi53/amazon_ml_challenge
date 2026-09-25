@@ -1,16 +1,23 @@
 """Memory-safe helpers for the (possibly multi-GB) competition TSVs.
 
 Nothing here loads a whole source file: files are read in chunks of ``CHUNKSIZE``
-rows (``dtype=str``, ``sep="\\t"``, ``keep_default_na=False``) and IDs are kept as
-64-bit hashes (8 bytes per ID) instead of Python strings. Comparing IDs by hash
-is exact up to 64-bit collisions (~1e-6 probability for 1e7 IDs).
+rows (``dtype=str``, ``sep="\\t"``, ``keep_default_na=False``, ``quoting=QUOTE_NONE``) and IDs
+are kept as 64-bit hashes (8 bytes per ID) instead of Python strings. Comparing IDs by hash
+is exact up to 64-bit collisions (~1e-6 probability for 1e7 IDs); IDs are stripped of
+surrounding whitespace before hashing.
+
+Why ``QUOTE_NONE``: the files are one record per line with tabs as the only delimiter. With
+pandas' default quoting, a field that merely STARTS with ``"`` (e.g. ``"Joe's Diner``) opens a
+quoted field that swallows the following lines, silently dropping rows (and their IDs). Use
+``raw_line_stats`` to cross-check parsed row counts against the physical line count.
 """
 from __future__ import annotations
 
+import csv
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,7 +52,7 @@ def read_header(path) -> List[str]:
     Returns:
         List of column names.
     """
-    return pd.read_csv(path, sep="\t", nrows=0, dtype=str).columns.tolist()
+    return pd.read_csv(path, sep="\t", nrows=0, dtype=str, quoting=csv.QUOTE_NONE).columns.tolist()
 
 
 def iter_chunks(path, usecols: Optional[Sequence[str]] = None, chunksize: Optional[int] = None) -> Iterator[pd.DataFrame]:
@@ -61,7 +68,8 @@ def iter_chunks(path, usecols: Optional[Sequence[str]] = None, chunksize: Option
         DataFrames of at most ``chunksize`` rows, every column ``str``, no NaN.
     """
     yield from pd.read_csv(
-        path, sep="\t", dtype=str, keep_default_na=False, usecols=usecols, chunksize=chunksize or CHUNKSIZE
+        path, sep="\t", dtype=str, keep_default_na=False, usecols=usecols, chunksize=chunksize or CHUNKSIZE,
+        quoting=csv.QUOTE_NONE,
     )
 
 
@@ -69,14 +77,14 @@ def hash_ids(ids: pd.Series, seed: int = 0, salt: str = "") -> np.ndarray:
     """Deterministically hash IDs to uint64 (stable across runs and chunk sizes).
 
     Args:
-        ids: Series of ID strings.
+        ids: Series of ID strings (surrounding whitespace is ignored).
         seed: Global seed mixed into the hash.
         salt: Extra label so different uses of the same seed give independent hashes.
 
     Returns:
         ``uint64`` array aligned with ``ids``.
     """
-    return pd.util.hash_pandas_object(f"{seed}:{salt}:" + ids, index=False).to_numpy()
+    return pd.util.hash_pandas_object(f"{seed}:{salt}:" + ids.str.strip(), index=False).to_numpy()
 
 
 def isin_sorted(values: np.ndarray, sorted_ref: np.ndarray) -> np.ndarray:
@@ -96,6 +104,30 @@ def isin_sorted(values: np.ndarray, sorted_ref: np.ndarray) -> np.ndarray:
     return sorted_ref[idx] == values
 
 
+def raw_line_stats(path, block_bytes: int = 16 * 1024 * 1024) -> Tuple[int, int]:
+    """Count physical data lines and double-quote characters of a file, without parsing it.
+
+    Independent of the CSV parser, so it exposes rows lost (or merged) by parsing.
+
+    Args:
+        path: File path.
+        block_bytes: Read block size.
+
+    Returns:
+        ``(data_lines, quote_chars)`` where ``data_lines`` excludes the header line.
+    """
+    lines = quotes = 0
+    last = b"\n"
+    with open(path, "rb") as f:
+        while block := f.read(block_bytes):
+            lines += block.count(b"\n")
+            quotes += block.count(b'"')
+            last = block[-1:]
+    if last != b"\n":
+        lines += 1  # final line without trailing newline
+    return max(lines - 1, 0), quotes
+
+
 @dataclass
 class ScanResult:
     """Streaming statistics of one source TSV."""
@@ -108,6 +140,7 @@ class ScanResult:
     empty_name: int = 0
     empty_address: int = 0
     bad_prefix: int = 0
+    ids_with_whitespace: int = 0
     id_hashes: Optional[np.ndarray] = None  # only when keep_ids=True
 
     @property
@@ -143,8 +176,9 @@ def scan_source(path, expect_prefix: Optional[str] = None, keep_ids: bool = Fals
         if ADDRESS_COL in chunk:
             res.empty_address += int((chunk[ADDRESS_COL].str.strip() == "").sum())
         if ID_COL in chunk:
+            res.ids_with_whitespace += int((chunk[ID_COL] != chunk[ID_COL].str.strip()).sum())
             if expect_prefix:
-                res.bad_prefix += int((~chunk[ID_COL].str.startswith(expect_prefix)).sum())
+                res.bad_prefix += int((~chunk[ID_COL].str.strip().str.startswith(expect_prefix)).sum())
             if keep_ids:
                 hashes.append(hash_ids(chunk[ID_COL]))
     if keep_ids:

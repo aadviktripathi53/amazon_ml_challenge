@@ -25,7 +25,7 @@ import pandas as pd
 from . import streaming
 from .config import DATA_DIR, REPORTS_DIR
 from .io_utils import ID_COL, MATCHED_COL, S2_PREFIX, S3_PREFIX, TRUTH_ID_COL
-from .streaming import ScanResult, hash_ids, human_size, isin_sorted, iter_chunks, read_header, scan_source
+from .streaming import ScanResult, hash_ids, human_size, isin_sorted, iter_chunks, raw_line_stats, read_header, scan_source
 
 HIST_CAP = 10  # matches-per-S1 histogram is bucketed as 0..HIST_CAP-1 and "HIST_CAP+"
 EXAMPLES = 5
@@ -93,15 +93,19 @@ def profile_ground_truth(path: Path, source_ids: Dict[str, np.ndarray]) -> dict:
     rows = n_s2 = n_s3 = n_other = both = 0
     s1_hashes: List[np.ndarray] = []
     match_hashes: List[np.ndarray] = []
-    missing = {"S1": 0, "S2": 0, "S3": 0}
+    missing = {"S1": 0, "S2": 0, "S3": 0}  # mentions (rows/tokens) absent from the source file
+    missing_hashes: Dict[str, List[np.ndarray]] = {"S1": [], "S2": [], "S3": []}
+    whitespace_ids = 0
     missing_examples: Dict[str, List[str]] = {"S1": [], "S2": [], "S3": []}
 
     def check(key: str, ids: pd.Series) -> None:
         """Count (and sample) IDs of one source that are absent from the source file."""
         if key not in ref or ids.empty:
             return
-        absent = ~isin_sorted(hash_ids(ids), ref[key])
+        hashes = hash_ids(ids)
+        absent = ~isin_sorted(hashes, ref[key])
         missing[key] += int(absent.sum())
+        missing_hashes[key].append(hashes[absent])
         if len(missing_examples[key]) < EXAMPLES:
             missing_examples[key] += ids[absent].head(EXAMPLES - len(missing_examples[key])).tolist()
 
@@ -113,7 +117,9 @@ def profile_ground_truth(path: Path, source_ids: Dict[str, np.ndarray]) -> dict:
         hist.update(pd.Series(n).value_counts().to_dict())
         c2, c3 = matched.str.count(S2_PREFIX), matched.str.count(S3_PREFIX)
         both += int(((c2 > 0) & (c3 > 0)).sum())
-        ex = parts.explode().str.strip()
+        raw_ex = parts.explode()
+        whitespace_ids += int((raw_ex != raw_ex.str.strip()).sum()) + int((chunk[TRUTH_ID_COL] != chunk[TRUTH_ID_COL].str.strip()).sum())
+        ex = raw_ex.str.strip()
         ex = ex[ex != ""]
         is2, is3 = ex.str.startswith(S2_PREFIX), ex.str.startswith(S3_PREFIX)
         n_s2, n_s3, n_other = n_s2 + int(is2.sum()), n_s3 + int(is3.sum()), n_other + int((~is2 & ~is3).sum())
@@ -129,6 +135,7 @@ def profile_ground_truth(path: Path, source_ids: Dict[str, np.ndarray]) -> dict:
     s1_without_gt = None
     if "S1" in ref:
         s1_without_gt = int((~isin_sorted(ref["S1"], np.sort(all_s1))).sum())
+    missing_distinct = {k: int(len(np.unique(np.concatenate(v)))) if v else 0 for k, v in missing_hashes.items()}
     binned: Counter = Counter()
     for k, v in hist.items():
         binned[k if k < HIST_CAP else HIST_CAP] += v
@@ -136,7 +143,8 @@ def profile_ground_truth(path: Path, source_ids: Dict[str, np.ndarray]) -> dict:
         "rows": rows, "singletons": int(hist.get(0, 0)), "hist": binned, "n_s2": n_s2, "n_s3": n_s3, "n_other": n_other,
         "s1_with_both": both, "dup_gt_s1_rows": int(len(all_s1) - len(np.unique(all_s1))),
         "shared_match_ids": int((mult > 1).sum()), "max_multiplicity": int(mult.max()) if len(mult) else 0,
-        "missing": missing, "missing_examples": missing_examples, "checked": sorted(ref), "s1_without_gt": s1_without_gt,
+        "missing": missing, "missing_distinct": missing_distinct, "distinct_gt_s1": int(len(np.unique(all_s1))),
+        "distinct_match_ids": int(len(mult)), "whitespace_ids": whitespace_ids, "missing_examples": missing_examples, "checked": sorted(ref), "s1_without_gt": s1_without_gt,
     }
 
 
@@ -166,8 +174,53 @@ def profile(data_dir: Path) -> dict:
         else:
             other_rows[path] = count_rows(path)
     truth = profile_ground_truth(truth_path, train_ids) if truth_path else None
+    raw = {p: raw_line_stats(p) for p in files}
     return {"data_dir": data_dir, "files": files, "kinds": kinds, "scans": scans, "other_rows": other_rows,
-            "truth": truth, "truth_path": truth_path}
+            "truth": truth, "truth_path": truth_path, "raw": raw}
+
+
+def parsed_rows(result: dict, path: Path) -> int:
+    """Number of data rows the CSV parser produced for a profiled file.
+
+    Args:
+        result: Output of ``profile``.
+        path: A profiled file.
+
+    Returns:
+        Parsed row count.
+    """
+    if path in result["scans"]:
+        return result["scans"][path].rows
+    if path == result["truth_path"]:
+        return result["truth"]["rows"]
+    return result["other_rows"].get(path, 0)
+
+
+def integrity_warnings(result: dict) -> List[str]:
+    """List data-integrity problems: parsed rows != physical lines, whitespace in IDs, bad prefixes.
+
+    Args:
+        result: Output of ``profile``.
+
+    Returns:
+        Human-readable warnings (empty list when everything is consistent).
+    """
+    root, warn = result["data_dir"], []
+    for p in result["files"]:
+        lines, quotes = result["raw"][p]
+        rows = parsed_rows(result, p)
+        if rows != lines:
+            warn.append(f"`{p.relative_to(root)}`: parser produced {rows:,} rows but the file has {lines:,} data lines "
+                        f"({abs(lines - rows):,} lost/merged; {quotes:,} double-quote characters in file)")
+    for p, s in result["scans"].items():
+        if s.ids_with_whitespace:
+            warn.append(f"`{p.relative_to(root)}`: {s.ids_with_whitespace:,} entity_ids have leading/trailing whitespace")
+        if s.bad_prefix:
+            warn.append(f"`{p.relative_to(root)}`: {s.bad_prefix:,} entity_ids have an unexpected prefix")
+    t = result["truth"]
+    if t and t["whitespace_ids"]:
+        warn.append(f"ground truth: {t['whitespace_ids']:,} IDs have leading/trailing whitespace")
+    return warn
 
 
 def _pct(part: int, whole: int) -> str:
@@ -186,13 +239,18 @@ def render_markdown(result: dict) -> str:
     """
     L: List[str] = ["# Data profile", "", f"Data dir: `{result['data_dir']}`  ",
                     f"Streaming chunk size: {streaming.CHUNKSIZE:,} rows. IDs compared via 64-bit hashes.", "",
-                    "## Files", "", "| file | size | rows | columns |", "|---|---|---|---|"]
+                    "## Files", "", "| file | size | parsed rows | raw data lines | columns |", "|---|---|---|---|---|"]
     root = result["data_dir"]
     for p in result["files"]:
         s = result["scans"].get(p)
         rows = s.rows if s else (result["truth"]["rows"] if p == result["truth_path"] else result["other_rows"].get(p, "?"))
         cols = s.columns if s else read_header(p)
-        L.append(f"| {p.relative_to(root)} | {human_size(p.stat().st_size)} | {rows:,} | {', '.join(cols)} |")
+        lines, quotes = result["raw"][p]
+        flag = "" if lines == rows else " **MISMATCH**"
+        L.append(f"| {p.relative_to(root)} | {human_size(p.stat().st_size)} | {rows:,} | {lines:,}{flag} | {', '.join(cols)} |")
+    warns = integrity_warnings(result)
+    L += ["", "## Integrity checks", ""]
+    L += [f"- WARNING: {w}" for w in warns] if warns else ["- OK: parsed row counts equal physical line counts; IDs are clean."]
     L += ["", "## Source files", ""]
     for p, s in result["scans"].items():
         L += [f"### {p.relative_to(root)}", "",
@@ -218,16 +276,21 @@ def render_markdown(result: dict) -> str:
         for k in sorted(t["hist"]):
             label = f"{HIST_CAP}+" if k == HIST_CAP else str(k)
             L.append(f"| {label} | {t['hist'][k]:,} | {_pct(t['hist'][k], rows)} |")
-        L += ["", "Existence of ground-truth IDs in the train source files:", ""]
+        s1 = next((s for p, s in result["scans"].items() if p.name.endswith("source1.tsv") and p.parent.name == "train"), None)
+        if s1 is not None:
+            L += ["", "Ground truth vs Source 1 (train):", "",
+                  f"- ground-truth rows: {rows:,}; distinct source1_entity_id: {t['distinct_gt_s1']:,}",
+                  f"- train_source1.tsv: parsed rows {s1.rows:,}; distinct entity_ids {s1.rows - (s1.duplicate_ids or 0):,}",
+                  f"- distinct ground-truth S1 IDs absent from train_source1.tsv: {t['missing_distinct']['S1']:,}",
+                  f"- train S1 IDs without a ground-truth row: {t['s1_without_gt']:,}"]
+        L += ["", "Existence of ground-truth IDs in the train source files (mentions / distinct IDs):", ""]
         for key in ("S1", "S2", "S3"):
             if key in t["checked"]:
                 ex = f" e.g. {t['missing_examples'][key]}" if t["missing"][key] else ""
-                L.append(f"- {key}: {t['missing'][key]:,} missing{ex}")
+                L.append(f"- {key}: {t['missing'][key]:,} missing mentions / {t['missing_distinct'][key]:,} distinct{ex}")
             else:
                 L.append(f"- {key}: not checked (train source file not found)")
-        if t["s1_without_gt"] is not None:
-            L.append(f"- train S1 records without a ground-truth row: {t['s1_without_gt']:,}")
-        verdict = all(t["missing"][k] == 0 for k in t["checked"]) and len(t["checked"]) == 3
+        verdict = all(t["missing"][k] == 0 for k in t["checked"]) and len(t["checked"]) == 3 and not warns
         L += ["", f"**Every ground-truth ID exists in the source files: {'YES' if verdict else 'NO / not fully checked'}**", ""]
     else:
         L += ["## Ground truth", "", "No file with a `source1_entity_id` column found.", ""]

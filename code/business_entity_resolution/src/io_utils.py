@@ -11,6 +11,7 @@ source is given by its entity_id prefix (S1-/S2-/S3-).
 """
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
@@ -39,13 +40,16 @@ S1_PREFIX, S2_PREFIX, S3_PREFIX = "S1-", "S2-", "S3-"
 def read_tsv(path) -> pd.DataFrame:
     """Read a TSV keeping every column as a string and empty cells as "".
 
+    Quote characters are literal (``QUOTE_NONE``): fields are never quoted and a stray leading
+    ``"`` must not swallow the following rows (see ``src.streaming``).
+
     Args:
         path: Path to the tab-separated file.
 
     Returns:
         DataFrame with ``str`` dtype everywhere and no NaN values.
     """
-    return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, quoting=csv.QUOTE_NONE)
 
 
 def parse_id_list(value: str) -> Set[str]:

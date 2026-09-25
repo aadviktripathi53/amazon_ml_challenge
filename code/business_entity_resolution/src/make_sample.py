@@ -18,6 +18,7 @@ Run from ``code/business_entity_resolution/``::
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import sys
 from collections import Counter, defaultdict
@@ -96,14 +97,14 @@ def select_s1(base: Path, n_s1: int, seed: int) -> Tuple[Set[str], Counter, int]
     """
     singleton: Dict[str, bool] = {}
     for c in iter_chunks(truth_path(base), usecols=[TRUTH_ID_COL, MATCHED_COL]):
-        singleton.update(zip(c[TRUTH_ID_COL], (c[MATCHED_COL].str.strip() == "")))
+        singleton.update(zip(c[TRUTH_ID_COL].str.strip(), (c[MATCHED_COL].str.strip() == "")))
     strata: Dict[tuple, List[Tuple[int, str]]] = defaultdict(list)
     countries: Counter = Counter()
     skipped = 0
     for c in iter_chunks(source_path(base, "train", 1), usecols=[ID_COL, COUNTRY_COL]):
         countries.update(c[COUNTRY_COL].value_counts().to_dict())
         h = hash_ids(c[ID_COL], seed, "s1")
-        for eid, country, hv in zip(c[ID_COL], c[COUNTRY_COL], h):
+        for eid, country, hv in zip(c[ID_COL].str.strip(), c[COUNTRY_COL], h):
             if eid not in singleton:
                 skipped += 1
                 continue
@@ -126,7 +127,7 @@ def filter_rows(path: Path, ids: Set[str], id_col: str) -> pd.DataFrame:
     Returns:
         DataFrame of the matching rows in file order.
     """
-    parts = [c[c[id_col].isin(ids)] for c in iter_chunks(path)]
+    parts = [c[c[id_col].str.strip().isin(ids)] for c in iter_chunks(path)]
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=read_header(path))
 
 
@@ -148,7 +149,7 @@ def pass_source(path: Path, matched: Set[str], k: int, seed: int, salt: str) -> 
     total = 0
     for c in iter_chunks(path):
         total += len(c)
-        is_m = c[ID_COL].isin(matched)
+        is_m = c[ID_COL].str.strip().isin(matched)
         h = hash_ids(c[ID_COL], seed, salt)
         keep.append(c[is_m].assign(_h=h[is_m.to_numpy()]))
         if k > 0:
@@ -190,10 +191,10 @@ def sample_test_file(src: Path, dst: Path, test_frac: float, seed: int) -> Tuple
             sub = c if thr is None else c[hash_ids(c[ID_COL], seed, "test") < thr]
             after += len(sub)
             ca.update(sub[COUNTRY_COL].value_counts().to_dict())
-            sub.to_csv(f, sep="\t", index=False, header=first, lineterminator="\n")
+            sub.to_csv(f, sep="\t", index=False, header=first, lineterminator="\n", quoting=csv.QUOTE_NONE)
             first = False
         if first:
-            pd.DataFrame(columns=cols).to_csv(f, sep="\t", index=False, lineterminator="\n")
+            pd.DataFrame(columns=cols).to_csv(f, sep="\t", index=False, lineterminator="\n", quoting=csv.QUOTE_NONE)
     return before, after, cb, ca
 
 
@@ -205,7 +206,7 @@ def write_tsv(df: pd.DataFrame, path: Path) -> None:
         path: Output path (parent created).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, sep="\t", index=False, lineterminator="\n")
+    df.to_csv(path, sep="\t", index=False, lineterminator="\n", quoting=csv.QUOTE_NONE)
 
 
 def _share_dev(orig: Counter, samp: Counter, statistical: bool) -> Tuple[float, float]:
