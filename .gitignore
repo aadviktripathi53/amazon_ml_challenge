@@ -216,12 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-   
-   # Competition data and pipeline outputs
-   dataset/
-   data/
-   output/
-   
-   # Environment
-   *.pem
-   .venv/
+
+# Competition data and pipeline outputs
+dataset/
+data/
+output/
+
+# Environment
+*.pem
+.venv/
+
+# OS / local tooling
+.DS_Store
+.claude/

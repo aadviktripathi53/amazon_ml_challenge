@@ -54,7 +54,9 @@ experiments.md        log of every experiment and score
 3. features   -> data/interim/features_{split}.parquet     (s1_id, cand_id, feature columns..., label for train/val)
 4. train/predict -> data/interim/preds_{split}.parquet     (s1_id, cand_id, prob)
 5. decide + write -> output/matching_results.tsv, output/candidate_pairs.tsv
-Splits: train, val, test. Each stage runs as: python -m src.<stage> --split <split>
+Splits: train, val, test. Each stage runs from code/business_entity_resolution/ as:
+`python -m src.<stage> --split <split>` (stages: normalize, block, features, train, decide).
+All paths come from src/config.py (DATA_DIR from env var ER_DATA_DIR, default <repo_root>/dataset).
 Do NOT change a file schema without updating docs/contracts.md and telling the team.
 
 ## Validation (our "practice exam")
@@ -73,7 +75,8 @@ Append one row to experiments.md after every meaningful run:
 - Python 3.10+. Every function has a docstring explaining what it does (organisers require commented code).
 - Pin all versions in requirements.txt. Core libs: pandas, numpy, scikit-learn, rapidfuzz, lightgbm, unidecode, pyarrow, pytest.
 - Set random seeds everywhere (seed 42) so results are reproducible.
-- Keep scripts runnable from the repo root. No hard-coded absolute paths.
+- Pipeline commands run from code/business_entity_resolution/ as `python -m src.<module>` (the validator and run_all.sh run from the repo root).
+- Every module imports paths from src/config.py. No hard-coded paths.
 - Prefer small, testable functions. Add unit tests for the metric and the output writer.
 - No API keys or AWS credentials in code, ever.
 
@@ -90,8 +93,9 @@ Append one row to experiments.md after every meaningful run:
 
 ## CURRENT PHASE: Phase 0 (setup, dataset not yet received)
 Goals for this phase:
-- [ ] Create the repo structure above, .gitignore (dataset/, data/, output/, __pycache__, .venv), requirements.txt
-- [ ] src/io_utils.py: loaders for sources and ground truth (parse matched ids into sets; empty -> empty set)
+- [x] Create the repo structure above, .gitignore (dataset/, data/, output/, __pycache__, .venv), requirements.txt
+- [x] src/config.py (paths + seed)
+- [x] src/io_utils.py: loaders for sources and ground truth (parse matched ids into sets; empty -> empty set)
 - [ ] src/evaluate.py: macro F0.5 exactly as specified, blocking recall report, 80/20 split, unit tests
       (worked example: predicted 3, true 2, 2 correct -> 0.714; singleton edge cases)
 - [ ] src/write_submission.py: writes both TSVs per the rules; asserts matches are a subset of candidates
