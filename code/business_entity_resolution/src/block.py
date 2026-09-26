@@ -83,12 +83,13 @@ META_PATH = INTERIM_DIR / "block_meta.json"
 TEXT_COLUMNS = ["name_core", "postcode", "city_token", "addr_norm"]
 SOURCES = ("S2", "S3")
 
-# Budget model: bytes per document per channel, measured with tracemalloc on the sample (exact + pruned/transposed
-# matrices + transients, x2 safety) and the share of the budget given to each consumer.
-SHARD_BYTES_PER_DOC_PER_CHANNEL = 1500
-QUERY_BYTES_PER_QUERY = 8000  # exact + pruned query matrices + 2 sources x sum(K') x (idx, score, 3 cosines) + merge temporaries
-SHARD_BUDGET_SHARE = 0.35
-QUERY_BUDGET_SHARE = 0.25
+# Budget model, measured with tracemalloc on the full train data (US partition, name K'=6xK, duplicate-name channel on):
+# a pool shard holds ~217 B/doc/channel of matrices (exact + pruned transposed), x~3 for build transients -> 600;
+# a query costs ~11.4 KB live (both sources' top-K' states + query matrices) and ~19.8 KB at the merge peak -> 20000.
+SHARD_BYTES_PER_DOC_PER_CHANNEL = 600
+QUERY_BYTES_PER_QUERY = 20000
+SHARD_BUDGET_SHARE = 0.15
+QUERY_BUDGET_SHARE = 0.45  # the rest (~40%) is headroom: IDF vectors, the partition's query frame, pool id arrays, OS
 
 CANDIDATE_SCHEMA = pa.schema(
     [
@@ -146,6 +147,45 @@ def plan_budget(mem_gb: Optional[float] = None, n_channels: Optional[int] = None
     return Budget(shard_docs=int(np.clip(shard_docs, 20_000, 3_000_000)), query_block=int(np.clip(query_block, 20_000, 2_000_000)))
 
 
+def blocking_config() -> Dict[str, object]:
+    """Every setting that changes WHICH candidates are produced (memory/parallelism knobs excluded).
+
+    Stored with the train-side blocking decision; the test side must match it, otherwise the model would score
+    candidates generated differently from the ones it was trained on.
+
+    Returns:
+        JSON-serialisable settings dict.
+    """
+    from .normalize import ROMANIZE
+
+    return {
+        "channels": list(ENABLED), "k": dict(CHANNELS), "retrieve_mult": RETRIEVE_MULT,
+        "retrieve_mult_by_channel": dict(RETRIEVE_MULT_BY_CHANNEL), "addr_tiebreak_weight": ADDR_TIEBREAK_WEIGHT,
+        "rare_fallback_n": RARE_FALLBACK_N, "rare_fallback_channels": list(RARE_FALLBACK_CHANNELS),
+        "dup_n": DUP_N if DUP_ON else 0, "k_dup": K_DUP, "max_df_frac": MAX_DF_FRAC, "max_df_floor": MAX_DF_FLOOR,
+        "romanize": ROMANIZE,
+    }
+
+
+def check_blocking_config(meta: Dict[str, object]) -> None:
+    """Fail if the current blocking/normalize settings differ from those stored by the train side.
+
+    Args:
+        meta: Contents of ``block_meta.json``.
+
+    Raises:
+        ValueError: Listing every differing setting (meta files from before this check carry no config and pass).
+    """
+    stored = meta.get("config")
+    if stored is None:
+        return
+    current = json.loads(json.dumps(blocking_config()))  # same JSON round-trip as the stored copy
+    diff = {k: (stored.get(k), current.get(k)) for k in set(stored) | set(current) if stored.get(k) != current.get(k)}
+    if diff:
+        raise ValueError(f"blocking config differs from the train side (stored vs current): {diff} - "
+                         "use the same ER_* settings as run_train_side.sh or retrain")
+
+
 def country_equality_share() -> Dict[str, object]:
     """Share of true train pairs whose S1 and S2/S3 country labels are identical strings.
 
@@ -169,7 +209,8 @@ def country_equality_share() -> Dict[str, object]:
         total += joined.num_rows
         equal += int(pc.sum(pc.equal(joined.column("c1"), joined.column("c2")).cast(pa.int64())).as_py() or 0)
     share = equal / total if total else 1.0
-    meta = {"country_equal_share": share, "n_true_pairs": int(total), "partition_by_country": share >= COUNTRY_EQUAL_MIN}
+    meta = {"country_equal_share": share, "n_true_pairs": int(total), "partition_by_country": share >= COUNTRY_EQUAL_MIN,
+            "config": blocking_config()}
     ensure_dirs()
     with open(META_PATH, "w", encoding="utf-8") as fh:
         json.dump(meta, fh)
@@ -756,6 +797,7 @@ def run_block(splits: Sequence[str], n_jobs: int = 1, budget: Optional[Budget] =
     """
     budget = budget or plan_budget()
     meta = partition_decision(splits[0])
+    check_blocking_config(meta)
     print(f"block: true pairs with equal country label = {meta['country_equal_share']:.4%} "
           f"({meta['n_true_pairs']} pairs) -> partition by country: {meta['partition_by_country']}")
     print(f"block: memory budget {max_mem_gb():.1f} GB -> shards of {budget.shard_docs} docs, query blocks of {budget.query_block}, channels {ENABLED}, "

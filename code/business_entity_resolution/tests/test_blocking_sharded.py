@@ -274,3 +274,22 @@ def test_duplicate_name_channel_ignores_rare_names(tmp_path, monkeypatch):
     pq.write_table(pa.Table.from_pandas(_duplicate_name_corpus(10), preserve_index=False), path, row_group_size=13)
     table, *_ = run_partition(path, "US", 50)
     assert not table["ch_dup"].any()
+
+
+def test_blocking_config_mismatch_is_rejected(monkeypatch):
+    """The test side refuses to block with settings that differ from the train side's stored config."""
+    stored = {"config": B.blocking_config()}
+    B.check_blocking_config(stored)  # identical -> fine
+    B.check_blocking_config({})  # old meta without a config -> fine
+    monkeypatch.setattr(B, "DUP_N", 50)
+    with pytest.raises(ValueError, match="dup_n"):
+        B.check_blocking_config(stored)
+
+
+def test_query_block_fits_the_measured_budget():
+    """With the default 8 GB budget the planned query block and shard stay within their shares of the budget."""
+    b = B.plan_budget(8, 3)
+    budget = 8 * 1024 ** 3
+    assert b.query_block * B.QUERY_BYTES_PER_QUERY <= B.QUERY_BUDGET_SHARE * budget + B.QUERY_BYTES_PER_QUERY
+    assert b.shard_docs * 3 * B.SHARD_BYTES_PER_DOC_PER_CHANNEL <= B.SHARD_BUDGET_SHARE * budget + 3 * B.SHARD_BYTES_PER_DOC_PER_CHANNEL
+    assert B.SHARD_BUDGET_SHARE + B.QUERY_BUDGET_SHARE <= 0.65  # leave headroom

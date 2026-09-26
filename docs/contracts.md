@@ -63,8 +63,10 @@ partition, S1 chunk); a row group never splits an S1's candidates. `val` S1s are
 | `cos_name`, `cos_ctx`, `cos_addr` | float32 | EXACT char-3-gram TF-IDF cosine of the pair on that channel (for every union pair) |
 | `block_score` | float32 | max of the exact cosines |
 
-`data/interim/block_meta.json`: `{country_equal_share, n_true_pairs, partition_by_country}` measured on train
-ground truth (partition by country iff share >= 99.5%); val/test reuse it.
+`data/interim/block_meta.json`: `{country_equal_share, n_true_pairs, partition_by_country, config}` measured on train
+ground truth (partition by country iff share >= 99.5%); val/test reuse it. `config` fingerprints every setting that
+changes the candidates (channels, K, K' multipliers, tiebreak weight, fallback, duplicate-name channel, n-gram cap,
+`ER_ROMANIZE`); `block --split test` refuses to run if the current settings differ.
 `python -m src.block --split train` writes BOTH `candidates_train.parquet` and `candidates_val.parquet` in one pass over the
 pool; `--split val` then does nothing.
 

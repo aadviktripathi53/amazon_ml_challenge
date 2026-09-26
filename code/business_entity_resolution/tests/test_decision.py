@@ -127,3 +127,35 @@ def test_monte_carlo_blocks_respect_the_element_budget(monkeypatch):
     keep, best_k = D.choose_expected_f05(codes, p, p, n_draws=200)
     assert max(sizes) <= 200 * 60 or max(sizes) == 200 * 30  # a single 30-wide row may exceed a tiny budget alone
     assert len(best_k) == 400 and (np.bincount(codes[keep], minlength=400) == best_k).all()
+
+
+def test_test_split_exclusivity_spans_all_chunks(tmp_path, monkeypatch):
+    """decide --split test: S1s in DIFFERENT streamed chunks claiming the same candidate -> only the most probable keeps it."""
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    import src.decide as Dm
+
+    rows = []
+    for i in range(40):  # 40 S1s x 2 candidates; S1-00 and S1-39 (far apart -> different chunks) both claim S2-shared
+        rows += [(f"S1-{i:02d}", f"S2-own{i}", 0.95), (f"S1-{i:02d}", f"S3-x{i}", 0.01)]
+    rows[1] = ("S1-00", "S2-shared", 0.90)
+    rows[-1] = ("S1-39", "S2-shared", 0.97)
+    df = pd.DataFrame(rows, columns=["s1_id", "cand_id", "prob"])
+    preds = tmp_path / "preds_test.parquet"
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), preds, row_group_size=10)
+    monkeypatch.setattr(Dm, "preds_path", lambda split: preds)
+    monkeypatch.setattr(Dm, "matches_path", lambda split: tmp_path / f"matches_{split}.parquet")
+    monkeypatch.setattr(Dm, "load_calibration", lambda: {"x": [0.0, 1.0], "y": [0.0, 1.0]})
+    monkeypatch.setattr(Dm, "load_threshold", lambda: 0.65)
+    monkeypatch.setattr(Dm, "CHUNK_PAIRS", 8)  # many chunks
+    monkeypatch.setattr(Dm, "EXCLUSIVE", True)
+    for mode in ("hybrid", "expf", "threshold"):
+        monkeypatch.setattr(Dm, "DECISION", mode)
+        stats = Dm.run_decision("test")
+        out = pq.read_table(tmp_path / "matches_test.parquet").to_pandas()
+        shared = out[out.cand_id == "S2-shared"]
+        assert list(shared.s1_id) == ["S1-39"], mode  # the higher-probability claim wins across chunks
+        assert stats["exclusivity_removed_target"] == 1 and not out.duplicated("cand_id").any()
+        assert set(out.columns) == {"s1_id", "cand_id", "prob", "prob_cal"}

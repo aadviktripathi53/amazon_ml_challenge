@@ -212,18 +212,18 @@ def decide_frame(preds: pd.DataFrame, calib: Dict[str, list], threshold: float, 
     return keep, flat, p_cal
 
 
-def iter_s1_chunks(path, chunk_pairs: int = CHUNK_PAIRS):
+def iter_s1_chunks(path, chunk_pairs: Optional[int] = None):
     """Stream a prediction parquet as frames that never split an S1 (its rows are contiguous in the file).
 
     Args:
         path: ``preds_<split>.parquet`` (same row order as the candidates, so each S1's rows are contiguous).
-        chunk_pairs: Target rows per frame.
+        chunk_pairs: Target rows per frame (defaults to ``CHUNK_PAIRS``, read at call time).
 
     Returns:
         Iterator of ``s1_id, cand_id, prob`` frames.
     """
     carry = None
-    for batch in pq.ParquetFile(path).iter_batches(batch_size=chunk_pairs, columns=["s1_id", "cand_id", "prob"]):
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=chunk_pairs or CHUNK_PAIRS, columns=["s1_id", "cand_id", "prob"]):
         frame = batch.to_pandas()
         if carry is not None:
             frame = pd.concat([carry, frame], ignore_index=True)
