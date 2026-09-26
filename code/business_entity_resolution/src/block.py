@@ -51,6 +51,7 @@ from .io_utils import GROUND_TRUTH_SUFFIX
 from .normalize import records_path
 from .perf import SAMPLE_CAVEAT, peak_rss_mb, save_metrics, stage_timer
 from .split import SPLIT_PATH, load_split_ids
+from .streaming import isin_sorted
 from .tfidf import (
     N_FEATURES, document_frequency, hashed_counts, idf_vector, pair_cosine, prune_common, rare_fallback, tfidf_weight,
     topk_per_row,
@@ -69,6 +70,12 @@ MAX_DF_FLOOR = 500  # ... but never below this many documents
 RARE_FALLBACK_N = int(os.environ.get("ER_RARE_FALLBACK_N", "5"))  # rarest n-grams a zero-survivor query row gets back (0 = off)
 RARE_FALLBACK_CHANNELS = ("name", "ctx", "addr")  # channels the fallback applies to
 RETRIEVE_MULT = int(os.environ.get("ER_RETRIEVE_MULT", "4"))  # K' = RETRIEVE_MULT x K retrieved by pruned score, reranked to K
+RETRIEVE_MULT_BY_CHANNEL = {"name": int(os.environ.get("ER_RETRIEVE_MULT_NAME") or 6)}  # per-channel override (name: 6 x K)
+DUP_N = int(os.environ.get("ER_DUP_N", "20"))  # duplicate-name channel: query core names shared by > DUP_N pool docs (0 = off)
+K_DUP = int(os.environ.get("ER_K_DUP", "5"))  # per source, ranked by exact address cosine within the same-name cluster
+DUP_ON = DUP_N > 0 and "addr" in ENABLED
+ACTIVE = ENABLED + (["dup"] if DUP_ON else [])  # channels that produce top-K states
+RANK_CHANNELS = [*CHANNELS, "dup"]  # channels with a flag + rank column in the candidate file
 ADDR_TIEBREAK_WEIGHT = float(os.environ.get("ER_ADDR_TIEBREAK_W", "0.5"))  # name/ctx rerank key = exact cos + w x exact addr cos
 ADDR_TIEBREAK_CHANNELS = ("name", "ctx")
 COUNTRY_EQUAL_MIN = 0.995
@@ -87,7 +94,7 @@ CANDIDATE_SCHEMA = pa.schema(
     [
         ("s1_id", pa.string()), ("cand_id", pa.string()), ("country", pa.string()), ("ch_name", pa.bool_()),
         ("ch_ctx", pa.bool_()), ("ch_addr", pa.bool_()), ("rank_name", pa.float32()), ("rank_ctx", pa.float32()),
-        ("rank_addr", pa.float32()), ("cos_name", pa.float32()), ("cos_ctx", pa.float32()), ("cos_addr", pa.float32()),
+        ("rank_addr", pa.float32()), ("ch_dup", pa.bool_()), ("rank_dup", pa.float32()), ("cos_name", pa.float32()), ("cos_ctx", pa.float32()), ("cos_addr", pa.float32()),
         ("block_score", pa.float32()),
     ]
 )
@@ -263,6 +270,7 @@ class Idf:
         n_docs: Number of documents (S1+S2+S3) in the partition.
         max_df: Buckets with ``df > max_df`` are removed from the SEARCH matrices (not from the exact cosines).
         n_pool: Number of pool documents per source.
+        dup_hashes: Sorted hashes of the core names shared by more than ``DUP_N`` pool documents (empty when off).
     """
 
     df: Dict[str, np.ndarray]
@@ -270,6 +278,22 @@ class Idf:
     n_docs: int
     max_df: int
     n_pool: Dict[str, int]
+    dup_hashes: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
+
+
+def name_hash(names: pd.Series) -> np.ndarray:
+    """64-bit hash of each core name (0 for an empty name, which never forms a duplicate cluster).
+
+    Args:
+        names: ``name_core`` strings.
+
+    Returns:
+        uint64 array aligned with ``names``.
+    """
+    values = names.to_numpy(dtype=object)
+    h = pd.util.hash_array(values, categorize=False)
+    h[values == ""] = 0
+    return h
 
 
 def fit_idf(path, country: Optional[str]) -> Idf:
@@ -285,6 +309,7 @@ def fit_idf(path, country: Optional[str]) -> Idf:
     df = {ch: np.zeros(N_FEATURES, dtype=np.int64) for ch in ENABLED}
     n_pool = {s: 0 for s in SOURCES}
     n_docs = 0
+    pool_hashes: List[np.ndarray] = []
     columns = ["source", *TEXT_COLUMNS]
     for batch in iter_partition_batches(path, country, ("S1", "S2", "S3"), columns):
         frame = to_frame(batch)
@@ -293,8 +318,14 @@ def fit_idf(path, country: Optional[str]) -> Idf:
             n_pool[s] += int((frame["source"] == s).sum())
         for ch in ENABLED:
             df[ch] += document_frequency(hashed_counts(channel_text(frame, ch)))
+        if DUP_ON:
+            pool_hashes.append(name_hash(frame.loc[(frame["source"] != "S1").to_numpy(), "name_core"]))
+    dup_hashes = np.zeros(0, np.uint64)
+    if DUP_ON and pool_hashes:
+        values, counts = np.unique(np.concatenate(pool_hashes), return_counts=True)
+        dup_hashes = values[(counts > DUP_N) & (values != 0)]
     return Idf(df=df, idf={ch: idf_vector(df[ch], n_docs) for ch in ENABLED}, n_docs=n_docs,
-               max_df=max(MAX_DF_FLOOR, int(MAX_DF_FRAC * n_docs)), n_pool=n_pool)
+               max_df=max(MAX_DF_FLOOR, int(MAX_DF_FRAC * n_docs)), n_pool=n_pool, dup_hashes=dup_hashes)
 
 
 @dataclass
@@ -319,6 +350,8 @@ class QueryBlock:
     search: Dict[str, sp.csr_matrix] = field(default_factory=dict)
     exempt: Dict[str, np.ndarray] = field(default_factory=dict)
     n_fallback: Dict[str, int] = field(default_factory=dict)
+    name_hash: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
+    dup_mask: np.ndarray = field(default_factory=lambda: np.zeros(0, bool))
 
 
 def build_query_block(frame: pd.DataFrame, split_code: np.ndarray, idf: Idf) -> QueryBlock:
@@ -340,6 +373,9 @@ def build_query_block(frame: pd.DataFrame, split_code: np.ndarray, idf: Idf) -> 
             pruned, block.exempt[ch], block.n_fallback[ch] = rare_fallback(x, pruned, idf.df[ch], RARE_FALLBACK_N)
         block.exact[ch] = x
         block.search[ch] = pruned
+    if DUP_ON:
+        block.name_hash = name_hash(frame["name_core"])
+        block.dup_mask = isin_sorted(block.name_hash, idf.dup_hashes)
     return block
 
 
@@ -352,12 +388,14 @@ class Shard:
         offset: Index (within the partition's pool of this source) of the shard's first document.
         exact: Per channel full-vector matrix ``(n, N_FEATURES)``.
         search_t: Per channel pruned matrix, TRANSPOSED to ``(N_FEATURES, n)`` CSR for ``query @ shard``.
+        name_hash: Core-name hash per document (only when the duplicate-name channel is on).
     """
 
     ids: pa.Array
     offset: int
     exact: Dict[str, sp.csr_matrix]
     search_t: Dict[str, sp.csr_matrix]
+    name_hash: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
 
 
 def iter_shards(path, country: Optional[str], source: str, shard_docs: int, idf: Idf, exempt: Optional[Dict[str, np.ndarray]] = None) -> Iterator[Shard]:
@@ -377,24 +415,28 @@ def iter_shards(path, country: Optional[str], source: str, shard_docs: int, idf:
     """
     parts: Dict[str, List[sp.csr_matrix]] = {ch: [] for ch in ENABLED}
     ids: List[pa.Array] = []
+    hashes: List[np.ndarray] = []
     n = offset = 0
 
     def close() -> Shard:
         """Assemble the shard from the accumulated batches."""
         exact = {ch: sp.vstack(parts[ch], format="csr", dtype=np.float32) if len(parts[ch]) > 1 else parts[ch][0] for ch in ENABLED}
         search_t = {ch: prune_common(exact[ch], idf.df[ch], idf.max_df, (exempt or {}).get(ch)).T.tocsr() for ch in ENABLED}
-        return Shard(ids=pa.concat_arrays(ids), offset=offset, exact=exact, search_t=search_t)
+        return Shard(ids=pa.concat_arrays(ids), offset=offset, exact=exact, search_t=search_t,
+                     name_hash=np.concatenate(hashes) if hashes else np.zeros(0, np.uint64))
 
     for batch in iter_partition_batches(path, country, (source,), ["entity_id", "source", *TEXT_COLUMNS]):
         frame = to_frame(batch)
         for ch in ENABLED:
             parts[ch].append(tfidf_weight(hashed_counts(channel_text(frame, ch)), idf.idf[ch]))
         ids.append(batch.column("entity_id").cast(pa.string()))
+        if DUP_ON:
+            hashes.append(name_hash(frame["name_core"]))
         n += len(frame)
         if n >= shard_docs:
             yield close()
             offset += n
-            parts, ids, n = {ch: [] for ch in ENABLED}, [], 0
+            parts, ids, hashes, n = {ch: [] for ch in ENABLED}, [], [], 0
     if n:
         yield close()
 
@@ -414,8 +456,23 @@ class TopK:
     cos: np.ndarray
 
 
+def final_k(channel: str) -> int:
+    """Number of candidates finally kept per (channel, source).
+
+    Args:
+        channel: Channel name (``dup`` included).
+
+    Returns:
+        K.
+    """
+    return K_DUP if channel == "dup" else CHANNELS[channel]
+
+
 def retrieve_k(channel: str) -> int:
-    """Number of candidates kept per (channel, source) during the shard merge: ``K' = RETRIEVE_MULT x K``.
+    """Number of candidates kept per (channel, source) during the shard merge.
+
+    ``K' = multiplier x K`` (``ER_RETRIEVE_MULT``, overridable per channel, e.g. ``ER_RETRIEVE_MULT_NAME``); the
+    duplicate-name channel is already scored exactly, so it keeps ``K_DUP``.
 
     Args:
         channel: Channel name.
@@ -423,7 +480,9 @@ def retrieve_k(channel: str) -> int:
     Returns:
         K'.
     """
-    return RETRIEVE_MULT * CHANNELS[channel]
+    if channel == "dup":
+        return K_DUP
+    return RETRIEVE_MULT_BY_CHANNEL.get(channel, RETRIEVE_MULT) * CHANNELS[channel]
 
 
 def rerank_topk(state: TopK, channel: str) -> TopK:
@@ -440,8 +499,9 @@ def rerank_topk(state: TopK, channel: str) -> TopK:
     Returns:
         ``TopK`` with K slots per query, sorted by the rerank key (empty slots, idx -1, last).
     """
-    k = CHANNELS[channel]
-    key = np.nan_to_num(state.cos[:, :, ENABLED.index(channel)], nan=0.0).astype(np.float32)
+    k = final_k(channel)
+    own = "addr" if channel == "dup" else channel  # the duplicate-name channel ranks by address similarity
+    key = np.nan_to_num(state.cos[:, :, ENABLED.index(own)], nan=0.0).astype(np.float32)
     if channel in ADDR_TIEBREAK_CHANNELS and "addr" in ENABLED and ADDR_TIEBREAK_WEIGHT:
         key = key + ADDR_TIEBREAK_WEIGHT * np.nan_to_num(state.cos[:, :, ENABLED.index("addr")], nan=0.0)
     key = np.where(state.idx >= 0, key, -np.inf)
@@ -524,6 +584,44 @@ def search_shard(block: QueryBlock, shard: Shard, n_jobs: int, chunk_rows: Optio
     return out
 
 
+def search_dup(block: QueryBlock, shard: Shard, pair_chunk: int = 2_000_000) -> Tuple[np.ndarray, np.ndarray]:
+    """Duplicate-name channel for one shard: for queries whose core name is shared by > ``DUP_N`` pool docs, score
+    every shard document with EXACTLY the same core name by exact address cosine and keep the top ``K_DUP``.
+
+    Resolves crowding among identical names ('Ridgeline Inc' x 412) by locality instead of by n-gram luck.
+
+    Args:
+        block: Query block (with ``name_hash`` and ``dup_mask``).
+        shard: Pool shard (with ``name_hash``).
+        pair_chunk: Pairs per exact-cosine computation.
+
+    Returns:
+        ``(shard-local idx [n, K_DUP] (-1 empty), score [n, K_DUP] (-1 empty))``.
+    """
+    n = len(block.ids)
+    idx = np.full((n, K_DUP), -1, np.int32)
+    score = np.full((n, K_DUP), -1.0, np.float32)
+    qm = np.flatnonzero(block.dup_mask)
+    if len(qm) == 0:
+        return idx, score
+    wanted = np.unique(block.name_hash[qm])
+    sel = np.flatnonzero(isin_sorted(shard.name_hash, wanted))
+    if len(sel) == 0:
+        return idx, score
+    pairs = pd.DataFrame({"h": block.name_hash[qm], "q": qm}).merge(pd.DataFrame({"h": shard.name_hash[sel], "l": sel}), on="h")
+    q, l = pairs["q"].to_numpy(np.int64), pairs["l"].to_numpy(np.int64)
+    s = np.empty(len(q), np.float32)
+    for lo in range(0, len(q), pair_chunk):
+        s[lo : lo + pair_chunk] = pair_cosine(block.exact["addr"], q[lo : lo + pair_chunk], shard.exact["addr"], l[lo : lo + pair_chunk])
+    order = np.lexsort((l, -s, q))
+    q, l, s = q[order], l[order], s[order]
+    rank = np.arange(len(q)) - np.searchsorted(q, q, side="left")
+    keep = rank < K_DUP
+    idx[q[keep], rank[keep]] = l[keep]
+    score[q[keep], rank[keep]] = s[keep]
+    return idx, score
+
+
 def merge_shard_result(state: TopK, new_idx: np.ndarray, new_score: np.ndarray, shard: Shard, block: QueryBlock, pair_chunk: int = 400_000) -> TopK:
     """Merge one shard's top-K into the running global top-K and compute exact cosines for the new entries.
 
@@ -582,7 +680,7 @@ def emit_candidates(block: QueryBlock, states: Dict[Tuple[str, str], TopK], pool
             f[f"cos_{c2}"] = st.cos[lo:hi][q, slot, ci]
         frames.append(pd.DataFrame(f))
     allp = pd.concat(frames, ignore_index=True)
-    rank_cols = [f"rank_{ch}" for ch in ENABLED]
+    rank_cols = [f"rank_{ch}" for ch in ACTIVE]
     cos_cols = [f"cos_{ch}" for ch in ENABLED]
     agg = {**{c: "min" for c in rank_cols}, **{c: "first" for c in cos_cols}}
     pairs = allp.groupby(["q", "src", "idx"], sort=False).agg(agg).reset_index()
@@ -593,8 +691,8 @@ def emit_candidates(block: QueryBlock, states: Dict[Tuple[str, str], TopK], pool
             cand[m] = pool_ids[src].take(pa.array(pairs.loc[m, "idx"].to_numpy())).to_numpy(zero_copy_only=False)
     q = pairs["q"].to_numpy()
     out = {"s1_id": block.ids[lo + q], "cand_id": cand, "country": block.country[lo + q]}
-    for ch in CHANNELS:
-        rank = pairs[f"rank_{ch}"].to_numpy(dtype=np.float32) if ch in ENABLED else np.full(len(pairs), np.nan, np.float32)
+    for ch in RANK_CHANNELS:
+        rank = pairs[f"rank_{ch}"].to_numpy(dtype=np.float32) if ch in ACTIVE else np.full(len(pairs), np.nan, np.float32)
         out[f"ch_{ch}"] = ~np.isnan(rank)
         out[f"rank_{ch}"] = rank
     for ch in CHANNELS:
@@ -624,7 +722,7 @@ def block_query_block(path, country: Optional[str], block: QueryBlock, idf: Idf,
         ``(states {(channel, source): TopK}, pool_ids {source: Arrow id array of the whole pool})``.
     """
     n = len(block.ids)
-    states = {(ch, s): empty_topk(n, retrieve_k(ch)) for ch in ENABLED for s in SOURCES}
+    states = {(ch, s): empty_topk(n, retrieve_k(ch)) for ch in ACTIVE for s in SOURCES}
     pool_ids: Dict[str, List[pa.Array]] = {s: [] for s in SOURCES}
     for src in SOURCES:
         for i, shard in enumerate(iter_shards(path, country, src, budget.shard_docs, idf, block.exempt)):
@@ -632,6 +730,9 @@ def block_query_block(path, country: Optional[str], block: QueryBlock, idf: Idf,
             res = search_shard(block, shard, n_jobs)
             for ch in ENABLED:
                 states[(ch, src)] = merge_shard_result(states[(ch, src)], res[ch][0], res[ch][1], shard, block)
+            if DUP_ON:
+                d_idx, d_score = search_dup(block, shard)
+                states[("dup", src)] = merge_shard_result(states[("dup", src)], d_idx, d_score, shard, block)
             pool_ids[src].append(shard.ids)
             print(f"block: {label} {src} shard {i} ({len(shard.ids)} docs, offset {shard.offset}) searched by {n} queries in "
                   f"{time.perf_counter() - t0:.1f}s, peak RSS {peak_rss_mb():.0f} MB", flush=True)
@@ -658,7 +759,8 @@ def run_block(splits: Sequence[str], n_jobs: int = 1, budget: Optional[Budget] =
     print(f"block: true pairs with equal country label = {meta['country_equal_share']:.4%} "
           f"({meta['n_true_pairs']} pairs) -> partition by country: {meta['partition_by_country']}")
     print(f"block: memory budget {max_mem_gb():.1f} GB -> shards of {budget.shard_docs} docs, query blocks of {budget.query_block}, channels {ENABLED}, "
-          f"K'={RETRIEVE_MULT}xK reranked by exact cosine (+{ADDR_TIEBREAK_WEIGHT} x addr cosine for {list(ADDR_TIEBREAK_CHANNELS)})")
+          f"K'={RETRIEVE_MULT}xK (name {RETRIEVE_MULT_BY_CHANNEL['name']}xK) reranked by exact cosine (+{ADDR_TIEBREAK_WEIGHT} x addr cosine for {list(ADDR_TIEBREAK_CHANNELS)}), "
+          f"duplicate-name channel {'N>' + str(DUP_N) + ', K=' + str(K_DUP) if DUP_ON else 'off'}")
     path = path or records_path(splits[0])
     id_to_code: Optional[Dict[str, int]] = None
     if splits[0] != "test":
@@ -685,7 +787,8 @@ def run_block(splits: Sequence[str], n_jobs: int = 1, budget: Optional[Budget] =
             for lo in range(0, len(queries), budget.query_block):
                 sub = queries.iloc[lo : lo + budget.query_block].reset_index(drop=True)
                 block = build_query_block(sub, codes[lo : lo + budget.query_block], idf)
-                print(f"block: {label} rare-n-gram fallback rows (of {len(sub)}): {block.n_fallback}", flush=True)
+                print(f"block: {label} rare-n-gram fallback rows (of {len(sub)}): {block.n_fallback}"
+                      + (f"; duplicate-name queries (cluster > {DUP_N}): {int(block.dup_mask.sum())}" if DUP_ON else ""), flush=True)
                 states, pool_ids = block_query_block(path, country, block, idf, budget, n_jobs, label)
                 for e in range(0, len(block.ids), EMIT_ROWS):
                     table = emit_candidates(block, states, pool_ids, e, min(e + EMIT_ROWS, len(block.ids)))

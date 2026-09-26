@@ -99,3 +99,16 @@ def test_country_is_an_opaque_string_and_ids_are_stripped():
     assert list(out.columns) == OUT_COLUMNS
     assert out.loc[0, "entity_id"] == "S1-1" and out.loc[0, "country"] == "Atlantis"
     assert out.loc[0, "name_raw"] == "Café SARL"  # raw text is preserved
+
+
+def test_romanize_non_latin_tokens_only(monkeypatch):
+    """Non-Latin-script tokens are romanized (repeated letters collapsed, legal forms mapped); Latin tokens untouched."""
+    import src.normalize as N
+
+    assert N.romanize_non_latin("\u0905\u0932 \u0906\u0908\u091f\u0940 \u092a\u094d\u0930\u093e\u0907\u0935\u0947\u091f \u0932\u093f\u092e\u093f\u091f\u0947\u0921") == "al aiti private limited"
+    assert N.romanize_non_latin("Golden Solutions L\u00edmited") == "Golden Solutions L\u00edmited"  # accented Latin: unchanged
+    assert N.romanize_non_latin("Li Wei Trading") == "Li Wei Trading"  # 'li' is only mapped when it came from a non-Latin token
+    monkeypatch.setattr(N, "ROMANIZE", True)
+    assert N.name_core(N.normalize_name("\u0905\u0932 \u0906\u0908\u091f\u0940 \u092a\u094d\u0930\u093e\u0907\u0935\u0947\u091f \u0932\u093f\u092e\u093f\u091f\u0947\u0921")) == "al aiti"
+    monkeypatch.setattr(N, "ROMANIZE", False)
+    assert "aa" in N.normalize_name("\u0905\u0932 \u0906\u0908\u091f\u0940")  # off: plain unidecode

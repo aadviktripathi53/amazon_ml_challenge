@@ -107,7 +107,7 @@ def test_plan_budget_scales_with_the_memory_budget_and_is_clamped():
     assert B.plan_budget(8, 1).shard_docs > B.plan_budget(8, 3).shard_docs
 
 
-def test_feature_batch_values():
+def test_feature_batch_values():  # candidates without ch_dup columns still work (older files)
     """compute_batch gives sane numbers for a true pair, a missing address and a number conflict."""
     from src.features import FEATURE_COLUMNS, compute_batch
     from src.normalize import normalize_frame
@@ -211,8 +211,8 @@ def test_rerank_keeps_k_sorted_by_exact_cosine(records_path):
     """After rerank every (channel, source) has K slots whose rerank key is non-increasing."""
     _, _, _, states = run_partition(records_path, "US", 30)
     for (ch, _src), st in states.items():
-        assert st.idx.shape[1] == B.CHANNELS[ch]
-        key = np.nan_to_num(st.cos[:, :, B.ENABLED.index(ch)], nan=0.0)
+        assert st.idx.shape[1] == B.final_k(ch)
+        key = np.nan_to_num(st.cos[:, :, B.ENABLED.index("addr" if ch == "dup" else ch)], nan=0.0)
         if ch in B.ADDR_TIEBREAK_CHANNELS:
             key = key + B.ADDR_TIEBREAK_WEIGHT * np.nan_to_num(st.cos[:, :, B.ENABLED.index("addr")], nan=0.0)
         for row_key, row_idx in zip(key, st.idx):
@@ -250,3 +250,27 @@ def test_more_duplicates_than_k_prime_are_recovered_by_ctx(tmp_path):
     table, *_ = run_partition(path, "US", 50)
     true_row = table[table.cand_id == "S2-true"]
     assert len(true_row) == 1 and bool(true_row["ch_ctx"].iloc[0])
+
+
+def test_duplicate_name_channel_finds_the_same_name_at_the_matching_address(tmp_path, monkeypatch):
+    """With many identical names, the duplicate-name channel returns the one at the query's address first."""
+    monkeypatch.setattr(B, "DUP_N", 20)
+    monkeypatch.setattr(B, "DUP_ON", True)
+    monkeypatch.setattr(B, "ACTIVE", B.ENABLED + ["dup"])
+    path = tmp_path / "records.parquet"
+    pq.write_table(pa.Table.from_pandas(_duplicate_name_corpus(3 * B.retrieve_k("name")), preserve_index=False), path, row_group_size=13)
+    table, *_ = run_partition(path, "US", 50)
+    dup = table[table.ch_dup].sort_values("rank_dup")
+    assert dup.iloc[0]["cand_id"] == "S2-true" and len(dup) <= B.K_DUP
+    assert set(dup["cand_id"]) - {"S2-true"} <= {f"S2-{i}" for i in range(1000)}  # only same-name records
+
+
+def test_duplicate_name_channel_ignores_rare_names(tmp_path, monkeypatch):
+    """A name shared by <= DUP_N pool docs does not trigger the channel."""
+    monkeypatch.setattr(B, "DUP_N", 20)
+    monkeypatch.setattr(B, "DUP_ON", True)
+    monkeypatch.setattr(B, "ACTIVE", B.ENABLED + ["dup"])
+    path = tmp_path / "records.parquet"
+    pq.write_table(pa.Table.from_pandas(_duplicate_name_corpus(10), preserve_index=False), path, row_group_size=13)
+    table, *_ = run_partition(path, "US", 50)
+    assert not table["ch_dup"].any()

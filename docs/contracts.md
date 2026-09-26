@@ -59,6 +59,7 @@ partition, S1 chunk); a row group never splits an S1's candidates. `val` S1s are
 | `country` | str | partition label (= S1 country; `"*"` semantics not used, the S1's own label is written) |
 | `ch_name`, `ch_ctx`, `ch_addr` | bool | pair found by that channel (name_core / name_core+postcode+city / addr_norm) |
 | `rank_name`, `rank_ctx`, `rank_addr` | float32 | rank (1 = best) within that channel and source; NaN if not found by it |
+| `ch_dup`, `rank_dup` | bool, float32 | duplicate-name channel: query core name shared by > `ER_DUP_N` (20) pool docs -> top `ER_K_DUP` (5) per source of the SAME core name by exact address cosine |
 | `cos_name`, `cos_ctx`, `cos_addr` | float32 | EXACT char-3-gram TF-IDF cosine of the pair on that channel (for every union pair) |
 | `block_score` | float32 | max of the exact cosines |
 
@@ -71,7 +72,11 @@ Memory bound: `ER_MAX_MEM_GB` (default 8). The S2/S3 pool of each country is str
 per shard and query chunk the top-K is merged into a running global top-K, so memory does not grow with the pool (the
 result is independent of the shard size). The IDF of each channel is fitted once on the whole country partition
 (streaming, hashed n-grams; only document-frequency vectors are kept).
-Env knobs: `ER_MAX_MEM_GB`, `ER_CHANNELS` (default `name,ctx,addr`), `ER_N_JOBS`, `ER_BLOCK_CHUNK`.
+Retrieval keeps K' = 4 x K per channel/source (name: 6 x K, `ER_RETRIEVE_MULT[_NAME]`) by pruned score, then reranks by exact
+cosine (name/ctx: + `ER_ADDR_TIEBREAK_W` (0.5) x exact address cosine) to K.
+Env knobs: `ER_MAX_MEM_GB`, `ER_CHANNELS` (default `name,ctx,addr`), `ER_N_JOBS`, `ER_BLOCK_CHUNK`, `ER_RETRIEVE_MULT`,
+`ER_RETRIEVE_MULT_NAME`, `ER_ADDR_TIEBREAK_W`, `ER_DUP_N`, `ER_K_DUP`. Normalize: `ER_ROMANIZE=1` romanizes non-Latin-script
+name tokens (off by default: +0.0004 recall on the 5% run).
 
 ## 3. features -> `data/interim/features_{split}.parquet`
 
@@ -80,7 +85,7 @@ Same rows and order as `candidates_{split}.parquet`.
 | Column | Type | Notes |
 |---|---|---|
 | `s1_id`, `cand_id` | str | |
-| 35 feature columns (`src/features.py::FEATURE_COLUMNS`) | float32 | fuzzy scores on name_norm (`nn_*`), name_core (`nc_*`), addr_norm (`ad_*`): ratio/partial/tsort/tset/jw in [0,1]; `name_jaccard`, `core_exact`, `name_len_diff`, `addr_empty_s1/cand`, `num_shared`, `num_conflict`, `pc_state` (1 match / 0 missing / -1 conflict); blocking: `cand_is_s3`, `ch_*`, `n_channels`, `rank_*`, `cos_*`, `block_score` |
+| 37 feature columns (`src/features.py::FEATURE_COLUMNS`) | float32 | fuzzy scores on name_norm (`nn_*`), name_core (`nc_*`), addr_norm (`ad_*`): ratio/partial/tsort/tset/jw in [0,1]; `name_jaccard`, `core_exact`, `name_len_diff`, `addr_empty_s1/cand`, `num_shared`, `num_conflict`, `pc_state` (1 match / 0 missing / -1 conflict); blocking: `cand_is_s3`, `ch_*` (incl. `ch_dup`), `n_channels`, `rank_*` (incl. `rank_dup`), `cos_*`, `block_score` |
 | `label` | int8 (0/1) | train/val only; absent for test |
 
 ## 4. train/predict -> `data/interim/preds_{split}.parquet`, `model.txt`

@@ -13,7 +13,9 @@ country switches.
 """
 from __future__ import annotations
 
+import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
@@ -27,6 +29,20 @@ from .config import INTERIM_DIR, ensure_dirs, split_dir
 from .io_utils import ADDRESS_COL, COUNTRY_COL, ID_COL, NAME_COL, SOURCE_SUFFIXES
 from .perf import stage_timer
 from .streaming import CHUNKSIZE, iter_chunks
+
+# Non-Latin-script tokens (Devanagari, Bengali, Tamil, ...) are transliterated by unidecode into a scholarly spelling
+# with doubled letters ("praaivett limittedd"); collapsing repeated letters brings them closer to the English spelling
+# used by the other sources. Off unless ER_ROMANIZE=1. Tokens in Latin script (incl. accented) are never touched.
+ROMANIZE = os.environ.get("ER_ROMANIZE", "0") == "1"
+_REPEATED_LETTER = re.compile(r"([a-z])\1+")
+# Legal forms as they come out of the romanization above (mined from the most frequent romanized tokens of the train pool),
+# mapped to their English form so the normal legal-suffix stripping applies. Only applied to romanized tokens, so a Latin
+# name like "Li Wei" keeps its "li".
+ROMANIZED_LEGAL = {
+    **dict.fromkeys("praivet praibhet piraivet praivr privet pra".split(), "private"),
+    **dict.fromkeys("limited limitet limird limtid limitd li".split(), "limited"),
+    "elelpi": "llp", "kmpni": "company", "kampani": "company",
+}
 
 # Legal-form words and generic connector words removed to build ``name_core``.
 LEGAL_SUFFIXES: FrozenSet[str] = frozenset(
@@ -94,6 +110,43 @@ def ascii_fold(text: str) -> str:
     return text if text.isascii() else unidecode(text)
 
 
+def _is_non_latin_letter(ch: str) -> bool:
+    """True for a letter of a non-Latin script (e.g. Devanagari), False for ASCII and accented Latin letters.
+
+    Args:
+        ch: One character.
+
+    Returns:
+        Whether it is a non-Latin letter or a combining mark of one.
+    """
+    if ord(ch) < 128:
+        return False
+    name = unicodedata.name(ch, "")
+    return bool(name) and not name.startswith("LATIN") and (ch.isalpha() or unicodedata.category(ch).startswith("M"))
+
+
+def romanize_non_latin(text: str) -> str:
+    """Romanize the non-Latin-script tokens of a name: unidecode, lowercase, collapse repeated letters.
+
+    ``"अल आईटी प्राइवेट लिमिटेड"`` -> ``"al aiti private limited"``; Latin-script tokens are returned unchanged.
+
+    Args:
+        text: Raw name.
+
+    Returns:
+        Text with non-Latin tokens replaced by their simplified romanization.
+    """
+    if text.isascii():
+        return text
+    out = []
+    for tok in text.split():
+        if any(_is_non_latin_letter(ch) for ch in tok):
+            tok = _REPEATED_LETTER.sub(r"\1", unidecode(tok).lower())
+            tok = ROMANIZED_LEGAL.get(tok.strip(".,()"), tok)
+        out.append(tok)
+    return " ".join(out)
+
+
 def _clean_text(text: str) -> str:
     """Lowercase + ASCII-fold + ``&`` -> ``and`` + drop ``. ' ``` + other punctuation -> space + collapse spaces.
 
@@ -119,7 +172,7 @@ def normalize_name(raw: str) -> str:
     Returns:
         ``name_norm``.
     """
-    return _clean_text(raw)
+    return _clean_text(romanize_non_latin(raw) if ROMANIZE else raw)
 
 
 def name_core(name_norm: str) -> str:

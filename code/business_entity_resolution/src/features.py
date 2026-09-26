@@ -44,8 +44,8 @@ PAIR_COLUMNS = [
     "num_conflict", "pc_state",
 ]
 BLOCK_COLUMNS = [
-    "cand_is_s3", "ch_name", "ch_ctx", "ch_addr", "n_channels", "rank_name", "rank_ctx", "rank_addr", "cos_name",
-    "cos_ctx", "cos_addr", "block_score",
+    "cand_is_s3", "ch_name", "ch_ctx", "ch_addr", "ch_dup", "n_channels", "rank_name", "rank_ctx", "rank_addr", "rank_dup",
+    "cos_name", "cos_ctx", "cos_addr", "block_score",
 ]
 FEATURE_COLUMNS = FUZZY_COLUMNS + PAIR_COLUMNS + BLOCK_COLUMNS
 
@@ -176,7 +176,9 @@ def block_features(cands: pd.DataFrame) -> Dict[str, np.ndarray]:
         out[f"ch_{ch}"] = cands[f"ch_{ch}"].to_numpy(dtype=np.float32)
         out[f"rank_{ch}"] = cands[f"rank_{ch}"].to_numpy(dtype=np.float32)
         out[f"cos_{ch}"] = cands[f"cos_{ch}"].to_numpy(dtype=np.float32)
-    out["n_channels"] = out["ch_name"] + out["ch_ctx"] + out["ch_addr"]
+    out["ch_dup"] = cands["ch_dup"].to_numpy(dtype=np.float32) if "ch_dup" in cands else np.zeros(len(cands), np.float32)
+    out["rank_dup"] = cands["rank_dup"].to_numpy(dtype=np.float32) if "rank_dup" in cands else np.full(len(cands), np.nan, np.float32)
+    out["n_channels"] = out["ch_name"] + out["ch_ctx"] + out["ch_addr"] + out["ch_dup"]
     out["block_score"] = cands["block_score"].to_numpy(dtype=np.float32)
     return out
 

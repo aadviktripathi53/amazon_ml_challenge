@@ -36,10 +36,10 @@ def stream_recall(cand_path, truth: Dict[str, Set[str]]) -> Tuple[Set[Tuple[str,
     found: Set[Tuple[str, str]] = set()
     per_s1: Counter = Counter()
     n_cand = 0
-    by_channel = {ch: Counter() for ch in ("name", "ctx", "addr")}
+    by_channel = {ch: Counter() for ch in ("name", "ctx", "addr", "dup")}
     pf = pq.ParquetFile(cand_path)
     for rg in range(pf.num_row_groups):
-        t = pf.read_row_group(rg, columns=["s1_id", "cand_id", "ch_name", "ch_ctx", "ch_addr"])
+        t = pf.read_row_group(rg, columns=["s1_id", "cand_id", "ch_name", "ch_ctx", "ch_addr", "ch_dup"])
         n_cand += t.num_rows
         s1_list = t.column("s1_id").to_pylist()
         for ch in by_channel:
@@ -148,7 +148,7 @@ def report_blocking(split: str, cand_path: Optional[str] = None) -> Dict[str, ob
         "n_true_pairs": n_true,
         **{f"zero_{ch}_share": sum(1 for x in truth if by_channel[ch][x] == 0) / max(len(truth), 1) for ch in by_channel},
         "recall_by_channel": {ch: by_channel[ch]["__true_found__"] / max(n_true, 1) for ch in by_channel},
-        "zero_any_share": sum(1 for x in truth if all(by_channel[ch][x] == 0 for ch in by_channel)) / max(len(truth), 1),
+        "zero_any_share": sum(1 for x in truth if all(by_channel[ch][x] == 0 for ch in ("name", "ctx", "addr", "dup"))) / max(len(truth), 1),
     }
     print(f"blocking[{split}]: recall {recall:.4f} ({len(found)}/{n_true} true pairs), "
           f"S1s with the FULL true set captured {full_capture:.4f}, avg candidates per S1 {metrics['avg_candidates']:.1f}")
