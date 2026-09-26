@@ -133,3 +133,75 @@ def test_feature_batch_values():
     assert feats.loc["S3-1", "addr_empty_cand"] == 1 and feats.loc["S3-1", "ad_ratio"] == 0 and feats.loc["S3-1", "cand_is_s3"] == 1
     assert feats.loc["S3-1", "num_conflict"] == 0  # a missing address is not a number conflict
     assert (feats.drop(columns="s1_id").dtypes == np.float32).all()
+
+
+def _common_trigram_corpus(n_pool=1500):
+    """Pool where nearly every S2 name contains 'inc' (its trigrams exceed the cap) plus queries with rare-word names."""
+    rng = np.random.RandomState(1)
+    rare = ["zorblax", "quentin", "marigold", "vespera", "thornbury", "kestrel", "lumina", "obsidian"]
+    rows = [("S1-inc", "S1", "US", "inc inc inc", "", "x", "1 road x")]
+    for i in range(20):
+        rows.append((f"S1-r{i}", "S1", "US", f"{rng.choice(rare)} {rng.choice(rare)}", "", "x", f"{i} road x"))
+    for i in range(n_pool):
+        w = rare[i % len(rare)] if i % 3 == 0 else "common"
+        rows.append((f"S2-{i}", "S2", "US", f"inc {w} {i % 7}", "", "x", f"{i} road x"))
+    rows.append(("S3-0", "S3", "US", "zorblax marigold", "", "x", "5 road x"))
+    return pd.DataFrame(rows, columns=["entity_id", "source", "country", "name_core", "postcode", "city_token", "addr_norm"])
+
+
+def test_zero_survivor_row_gets_candidates_through_the_rare_ngram_fallback(tmp_path, monkeypatch):
+    """A name made only of over-cap trigrams ('inc inc inc') had 0 name candidates; the fallback gives it some."""
+    path = tmp_path / "records.parquet"
+    pq.write_table(pa.Table.from_pandas(_common_trigram_corpus(), preserve_index=False), path, row_group_size=300)
+    monkeypatch.setattr(B, "RARE_FALLBACK_N", 0)
+    before, idf, block_off, _ = run_partition(path, "US", 400)
+    assert idf.max_df == 500 and block_off.n_fallback["name"] == 0
+    assert not before[(before.s1_id == "S1-inc") & before.ch_name].shape[0], "premise: no name candidates without the fallback"
+    monkeypatch.setattr(B, "RARE_FALLBACK_N", 5)
+    after, _, block_on, _ = run_partition(path, "US", 400)
+    got = after[(after.s1_id == "S1-inc") & after.ch_name]
+    assert block_on.n_fallback["name"] == 1 and len(got) >= 1
+    assert (got["cos_name"] > 0).all() and got["cand_id"].str.startswith(("S2-", "S3-")).all()
+
+
+def test_rows_with_surviving_ngrams_are_unchanged_by_the_fallback(tmp_path, monkeypatch):
+    """The fallback is not a general relaxation: every other query gets exactly the same candidates as without it."""
+    path = tmp_path / "records.parquet"
+    pq.write_table(pa.Table.from_pandas(_common_trigram_corpus(), preserve_index=False), path, row_group_size=300)
+    monkeypatch.setattr(B, "RARE_FALLBACK_N", 0)
+    off, *_ = run_partition(path, "US", 400)
+    monkeypatch.setattr(B, "RARE_FALLBACK_N", 5)
+    on, *_ = run_partition(path, "US", 400)
+    key = lambda d: d[d.s1_id != "S1-inc"].sort_values(["s1_id", "cand_id"]).reset_index(drop=True)  # noqa: E731
+    # name/ctx channel content of the other rows must be identical (extra pool buckets only exist for the fallback row)
+    cols = ["s1_id", "cand_id", "ch_name", "ch_ctx", "ch_addr", "rank_name", "rank_ctx", "rank_addr", "cos_name", "cos_ctx", "cos_addr"]
+    pd.testing.assert_frame_equal(key(off)[cols], key(on)[cols])
+
+
+def test_rare_fallback_helper():
+    """Only zero-survivor rows change: they get their n_rare rarest buckets; the exempt mask lists exactly those."""
+    import scipy.sparse as sp
+
+    from src.tfidf import N_FEATURES, prune_common, rare_fallback
+
+    df = np.zeros(N_FEATURES, dtype=np.int64)
+    df[[10, 11, 12, 13]] = [900, 700, 800, 600]  # all above the cap of 500 -> pruned
+    df[[20, 21]] = [5, 6]  # rare -> survive
+    rows = [[10, 11, 12, 13], [10, 20], [], [12, 13]]  # row 0 and 3: zero survivors; row 1: survivor; row 2: empty
+    data, ind, ptr = [], [], [0]
+    for r in rows:
+        ind += r
+        data += [1.0] * len(r)
+        ptr.append(len(ind))
+    x = sp.csr_matrix((np.array(data, np.float32), np.array(ind), np.array(ptr)), shape=(4, N_FEATURES))
+    pruned = prune_common(x, df, 500)
+    assert list(np.diff(pruned.indptr)) == [0, 1, 0, 0]
+    out, exempt, n = rare_fallback(x, pruned, df, 2)
+    assert n == 2  # rows 0 and 3 only
+    assert set(out[0].indices) == {13, 11} and set(out[3].indices) == {13, 12}  # the 2 rarest by df (600, 700 / 600, 800)
+    assert set(out[1].indices) == {20} and out[2].nnz == 0  # untouched rows
+    assert set(np.flatnonzero(exempt)) == {11, 12, 13}
+    same, _, n0 = rare_fallback(x, pruned, df, 0)
+    assert n0 == 0 and (same != pruned).nnz == 0
+    pool = prune_common(x, df, 500, keep=exempt)  # the pool side keeps the exempt buckets
+    assert set(pool[0].indices) == {11, 12, 13} | ({10} & set())  # 10 (df 900) is not exempt here

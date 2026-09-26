@@ -23,7 +23,7 @@ TARGET_RECALL = 0.97
 N_EXAMPLES = 20
 
 
-def stream_recall(cand_path, truth: Dict[str, Set[str]]) -> Tuple[Set[Tuple[str, str]], Counter, int, int]:
+def stream_recall(cand_path, truth: Dict[str, Set[str]]) -> Tuple[Set[Tuple[str, str]], Counter, int, Dict[str, Counter]]:
     """Scan candidates once and collect which true pairs were found.
 
     Args:
@@ -31,20 +31,27 @@ def stream_recall(cand_path, truth: Dict[str, Set[str]]) -> Tuple[Set[Tuple[str,
         truth: ``{s1_id: {true ids}}`` restricted to the evaluated S1s.
 
     Returns:
-        ``(found_pairs, found_per_s1, n_candidates, n_candidate_s1)``.
+        ``(found_pairs, found_per_s1, n_candidates, {channel: candidates per S1 found by that channel})``.
     """
     found: Set[Tuple[str, str]] = set()
     per_s1: Counter = Counter()
     n_cand = 0
+    by_channel = {ch: Counter() for ch in ("name", "ctx", "addr")}
     pf = pq.ParquetFile(cand_path)
     for rg in range(pf.num_row_groups):
-        t = pf.read_row_group(rg, columns=["s1_id", "cand_id"])
+        t = pf.read_row_group(rg, columns=["s1_id", "cand_id", "ch_name", "ch_ctx", "ch_addr"])
         n_cand += t.num_rows
-        for s, c in zip(t.column("s1_id").to_pylist(), t.column("cand_id").to_pylist()):
+        s1_list = t.column("s1_id").to_pylist()
+        for ch in by_channel:
+            flags = t.column(f"ch_{ch}").to_pylist()
+            for s, f in zip(s1_list, flags):
+                if f:
+                    by_channel[ch][s] += 1
+        for s, c in zip(s1_list, t.column("cand_id").to_pylist()):
             if c in truth.get(s, ()):
                 found.add((s, c))
                 per_s1[s] += 1
-    return found, per_s1, n_cand, len(per_s1)
+    return found, per_s1, n_cand, by_channel
 
 
 def classify_misses(a: pd.DataFrame, b: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -118,7 +125,7 @@ def report_blocking(split: str, cand_path: Optional[str] = None) -> Dict[str, ob
     s1_rec = pq.read_table(rec_path, columns=["entity_id", "country"], filters=[("source", "=", "S1")]).to_pandas()
     country_of = dict(zip(s1_rec["entity_id"], s1_rec["country"]))
 
-    found, per_s1, n_cand, _ = stream_recall(cand_path, truth)
+    found, per_s1, n_cand, by_channel = stream_recall(cand_path, truth)
     total_by_c, found_by_c = defaultdict(int), defaultdict(int)
     for s, true in truth.items():
         total_by_c[country_of.get(s, "?")] += len(true)
@@ -136,10 +143,14 @@ def report_blocking(split: str, cand_path: Optional[str] = None) -> Dict[str, ob
         "n_pairs": n_cand,
         "n_s1": len(truth),
         "n_true_pairs": n_true,
+        **{f"zero_{ch}_share": sum(1 for x in truth if by_channel[ch][x] == 0) / max(len(truth), 1) for ch in by_channel},
+        "zero_any_share": sum(1 for x in truth if all(by_channel[ch][x] == 0 for ch in by_channel)) / max(len(truth), 1),
     }
     print(f"blocking[{split}]: recall {recall:.4f} ({len(found)}/{n_true} true pairs), "
           f"S1s with the FULL true set captured {full_capture:.4f}, avg candidates per S1 {metrics['avg_candidates']:.1f}")
     print("blocking recall per country:", {c: round(v, 4) for c, v in metrics["recall_by_country"].items()})
+    print(f"blocking[{split}]: share of S1 with ZERO candidates from: name {metrics['zero_name_share']:.4f}, ctx {metrics['zero_ctx_share']:.4f}, "
+          f"addr {metrics['zero_addr_share']:.4f}, ANY channel {metrics['zero_any_share']:.4f}")
     if recall < TARGET_RECALL:
         print(f"blocking recall {recall:.4f} < target {TARGET_RECALL}: analysing missed pairs")
         missed = [(s, c) for s, v in truth.items() for c in sorted(v) if (s, c) not in found]

@@ -50,7 +50,7 @@ from .normalize import records_path
 from .perf import SAMPLE_CAVEAT, peak_rss_mb, save_metrics, stage_timer
 from .split import SPLIT_PATH, load_split_ids
 from .tfidf import (
-    N_FEATURES, document_frequency, hashed_counts, idf_vector, pair_cosine, prune_common, tfidf_weight,
+    N_FEATURES, document_frequency, hashed_counts, idf_vector, pair_cosine, prune_common, rare_fallback, tfidf_weight,
     topk_per_row,
 )
 
@@ -64,6 +64,8 @@ EMIT_ROWS = 2000  # S1 queries per written Parquet row group
 BATCH_ROWS = 100_000  # rows per streamed record batch
 MAX_DF_FRAC = 0.002  # n-gram pruned from the SEARCH matrices when in > this share of the partition's documents ...
 MAX_DF_FLOOR = 500  # ... but never below this many documents
+RARE_FALLBACK_N = int(os.environ.get("ER_RARE_FALLBACK_N", "5"))  # rarest n-grams a zero-survivor query row gets back (0 = off)
+RARE_FALLBACK_CHANNELS = ("name", "ctx")  # channels the fallback applies to
 COUNTRY_EQUAL_MIN = 0.995
 META_PATH = INTERIM_DIR / "block_meta.json"
 TEXT_COLUMNS = ["name_core", "postcode", "city_token", "addr_norm"]
@@ -299,7 +301,10 @@ class QueryBlock:
         country: Country label of each query.
         split_code: Index of the output split (0 = first requested split) of each query.
         exact: Per channel full-vector matrix (for exact cosines).
-        search: Per channel matrix pruned of very common n-grams (for the sparse product).
+        search: Per channel matrix pruned of very common n-grams (for the sparse product), plus the rare-n-gram
+            fallback entries of rows that lost every n-gram to the cap.
+        exempt: Per channel bool mask of the buckets the pool side must NOT prune (the fallback buckets), if any.
+        n_fallback: Per channel number of query rows that needed the fallback.
     """
 
     ids: np.ndarray
@@ -307,6 +312,8 @@ class QueryBlock:
     split_code: np.ndarray
     exact: Dict[str, sp.csr_matrix] = field(default_factory=dict)
     search: Dict[str, sp.csr_matrix] = field(default_factory=dict)
+    exempt: Dict[str, np.ndarray] = field(default_factory=dict)
+    n_fallback: Dict[str, int] = field(default_factory=dict)
 
 
 def build_query_block(frame: pd.DataFrame, split_code: np.ndarray, idf: Idf) -> QueryBlock:
@@ -323,8 +330,11 @@ def build_query_block(frame: pd.DataFrame, split_code: np.ndarray, idf: Idf) -> 
     block = QueryBlock(ids=frame["entity_id"].to_numpy(dtype=object), country=frame["country"].to_numpy(dtype=object), split_code=split_code)
     for ch in ENABLED:
         x = tfidf_weight(hashed_counts(channel_text(frame, ch)), idf.idf[ch])
+        pruned = prune_common(x, idf.df[ch], idf.max_df)
+        if ch in RARE_FALLBACK_CHANNELS:  # rows with NO surviving n-gram get their rarest few back; other rows are untouched
+            pruned, block.exempt[ch], block.n_fallback[ch] = rare_fallback(x, pruned, idf.df[ch], RARE_FALLBACK_N)
         block.exact[ch] = x
-        block.search[ch] = prune_common(x, idf.df[ch], idf.max_df)
+        block.search[ch] = pruned
     return block
 
 
@@ -345,7 +355,7 @@ class Shard:
     search_t: Dict[str, sp.csr_matrix]
 
 
-def iter_shards(path, country: Optional[str], source: str, shard_docs: int, idf: Idf) -> Iterator[Shard]:
+def iter_shards(path, country: Optional[str], source: str, shard_docs: int, idf: Idf, exempt: Optional[Dict[str, np.ndarray]] = None) -> Iterator[Shard]:
     """Stream the pool of one source into shards of about ``shard_docs`` documents.
 
     Args:
@@ -354,6 +364,8 @@ def iter_shards(path, country: Optional[str], source: str, shard_docs: int, idf:
         source: ``"S2"`` or ``"S3"``.
         shard_docs: Target documents per shard (a shard is closed at the first batch boundary past this size).
         idf: Fitted IDF statistics.
+        exempt: Optional per channel mask of buckets that stay in the pruned pool matrices although above the cap
+            (the query block's fallback buckets).
 
     Returns:
         Iterator of ``Shard`` (only the current one should be kept alive by the caller).
@@ -365,7 +377,7 @@ def iter_shards(path, country: Optional[str], source: str, shard_docs: int, idf:
     def close() -> Shard:
         """Assemble the shard from the accumulated batches."""
         exact = {ch: sp.vstack(parts[ch], format="csr", dtype=np.float32) if len(parts[ch]) > 1 else parts[ch][0] for ch in ENABLED}
-        search_t = {ch: prune_common(exact[ch], idf.df[ch], idf.max_df).T.tocsr() for ch in ENABLED}
+        search_t = {ch: prune_common(exact[ch], idf.df[ch], idf.max_df, (exempt or {}).get(ch)).T.tocsr() for ch in ENABLED}
         return Shard(ids=pa.concat_arrays(ids), offset=offset, exact=exact, search_t=search_t)
 
     for batch in iter_partition_batches(path, country, (source,), ["entity_id", "source", *TEXT_COLUMNS]):
@@ -571,7 +583,7 @@ def block_query_block(path, country: Optional[str], block: QueryBlock, idf: Idf,
     states = {(ch, s): empty_topk(n, CHANNELS[ch]) for ch in ENABLED for s in SOURCES}
     pool_ids: Dict[str, List[pa.Array]] = {s: [] for s in SOURCES}
     for src in SOURCES:
-        for i, shard in enumerate(iter_shards(path, country, src, budget.shard_docs, idf)):
+        for i, shard in enumerate(iter_shards(path, country, src, budget.shard_docs, idf, block.exempt)):
             t0 = time.perf_counter()
             res = search_shard(block, shard, n_jobs)
             for ch in ENABLED:
@@ -626,6 +638,7 @@ def run_block(splits: Sequence[str], n_jobs: int = 1, budget: Optional[Budget] =
             for lo in range(0, len(queries), budget.query_block):
                 sub = queries.iloc[lo : lo + budget.query_block].reset_index(drop=True)
                 block = build_query_block(sub, codes[lo : lo + budget.query_block], idf)
+                print(f"block: {label} rare-n-gram fallback rows (of {len(sub)}): {block.n_fallback}", flush=True)
                 states, pool_ids = block_query_block(path, country, block, idf, budget, n_jobs, label)
                 for e in range(0, len(block.ids), EMIT_ROWS):
                     table = emit_candidates(block, states, pool_ids, e, min(e + EMIT_ROWS, len(block.ids)))

@@ -10,7 +10,7 @@ n-grams. Matrices are float32 CSR; nothing here builds a dense matrix.
 """
 from __future__ import annotations
 
-from typing import Sequence, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -92,7 +92,7 @@ def tfidf_weight(counts: sp.csr_matrix, idf: np.ndarray) -> sp.csr_matrix:
     return x
 
 
-def prune_common(x: sp.csr_matrix, df: np.ndarray, max_df: int) -> sp.csr_matrix:
+def prune_common(x: sp.csr_matrix, df: np.ndarray, max_df: int, keep: Optional[np.ndarray] = None) -> sp.csr_matrix:
     """Zero out n-grams whose document frequency exceeds ``max_df`` (search-time pruning only).
 
     The weights of the remaining n-grams are left unchanged, so a dot product of two pruned rows is a
@@ -103,14 +103,56 @@ def prune_common(x: sp.csr_matrix, df: np.ndarray, max_df: int) -> sp.csr_matrix
         x: Weighted CSR matrix.
         df: Document frequencies.
         max_df: Maximum allowed document frequency.
+        keep: Optional boolean mask over the buckets that are exempt from the cap (used on the POOL side for the
+            buckets that zero-survivor query rows fall back to, see ``rare_fallback``).
 
     Returns:
         New CSR matrix without the pruned entries.
     """
     y = x.copy()
-    y.data[df[y.indices] > max_df] = 0.0
+    drop = df[y.indices] > max_df
+    if keep is not None:
+        drop &= ~keep[y.indices]
+    y.data[drop] = 0.0
     y.eliminate_zeros()
     return y
+
+
+def rare_fallback(x: sp.csr_matrix, pruned: sp.csr_matrix, df: np.ndarray, n_rare: int) -> Tuple[sp.csr_matrix, np.ndarray, int]:
+    """Give every query row that lost ALL its n-grams to the frequency cap its ``n_rare`` rarest n-grams back.
+
+    Only rows that have n-grams in ``x`` but none left in ``pruned`` are touched (rows that still have a surviving
+    n-gram are returned unchanged). For such a row the ``n_rare`` buckets with the lowest document frequency (ties: lowest
+    bucket id) are restored with their original weights. Those buckets exceed the cap by construction, so they are absent
+    from the (pruned) pool matrices: the returned mask lists them so the pool side can exempt exactly these buckets.
+
+    Args:
+        x: Full weighted query matrix.
+        pruned: ``prune_common(x, df, max_df)``.
+        df: Document frequencies.
+        n_rare: Buckets restored per zero-survivor row (0 disables the fallback).
+
+    Returns:
+        ``(pruned matrix with the fallback entries, bool mask over buckets to exempt on the pool side, number of rows)``.
+    """
+    exempt = np.zeros(x.shape[1], dtype=bool)
+    if n_rare <= 0:
+        return pruned, exempt, 0
+    rows = np.flatnonzero((np.diff(pruned.indptr) == 0) & (np.diff(x.indptr) > 0))
+    if len(rows) == 0:
+        return pruned, exempt, 0
+    r_out, c_out, v_out = [], [], []
+    for r in rows:
+        lo, hi = x.indptr[r], x.indptr[r + 1]
+        cols, vals = x.indices[lo:hi], x.data[lo:hi]
+        pick = np.lexsort((cols, df[cols]))[:n_rare]
+        r_out.append(np.full(len(pick), r, dtype=np.int64))
+        c_out.append(cols[pick])
+        v_out.append(vals[pick])
+    r_all, c_all, v_all = np.concatenate(r_out), np.concatenate(c_out), np.concatenate(v_out)
+    exempt[c_all] = True
+    extra = sp.csr_matrix((v_all, (r_all, c_all)), shape=x.shape, dtype=np.float32)
+    return (pruned + extra).tocsr(), exempt, len(rows)
 
 
 def pair_cosine(a: sp.csr_matrix, ia: np.ndarray, b: sp.csr_matrix, ib: np.ndarray) -> np.ndarray:
