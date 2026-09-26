@@ -210,3 +210,17 @@ Full log: `experiments.md`.
 - Never commit `dataset/`, `data/`, `output/`, credentials or API keys.
 - After any meaningful change, add a row to `experiments.md` with validation F0.5 and blocking recall.
 - Keep every function documented with a docstring.
+
+
+## Baseline v0 (development notes)
+
+Run everything on the sample: `ER_DATA_DIR=dataset_sample bash run_all.sh` (from `code/business_entity_resolution/`);
+on the full data just `bash run_all.sh`. It prints a summary table (quality, stage times, peak memory) and runs the
+organisers' validator. Useful knobs: `ER_N_JOBS` (forked blocking workers), `ER_CHANNELS` (default `name,ctx,addr`),
+`ER_MAX_TRAIN_PAIRS` (cap on training rows; whole S1 groups are sampled), `ER_BLOCK_CHUNK`.
+
+* macOS: LightGBM needs `libomp` (`brew install libomp`); `run_all.sh` falls back to the copy bundled with scikit-learn.
+* Blocking uses a third channel (address char 3-grams) beyond the two in the brief: on the sample it lifts recall from
+  0.907 to 0.995 because many true pairs have transliterated or unrelated names but the same address.
+* Sample caveat: in `dataset_sample` the train S2/S3 pools are true matches + random distractors, so recall / F0.5 are
+  optimistic; the test sample is only for format checks.
