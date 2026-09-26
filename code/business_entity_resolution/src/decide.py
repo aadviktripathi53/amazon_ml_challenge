@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 
 from .cli import parse_split
 from .config import INTERIM_DIR, TRAIN_DIR, ensure_dirs
-from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth
+from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth_subset
 from .perf import SAMPLE_CAVEAT, load_metrics, save_metrics, stage_timer
 from .split import load_split_ids
 from .train import preds_path
@@ -102,10 +102,10 @@ def tune_on_oof() -> Dict[str, object]:
         ``{"threshold", "oof_macro_f05", "sweep", "n_s1"}``.
     """
     s1_ids = load_split_ids("train")
-    truth = load_ground_truth(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}")
-    preds = pq.read_table(preds_path("train")).to_pandas()
+    preds = pq.read_table(preds_path("train"), columns=["s1_id", "prob", "label"]).to_pandas()
     if load_metrics("train").get("sampled", False):  # the train stage sampled whole S1 groups: evaluate on those only
         s1_ids = sorted(set(preds["s1_id"]))
+    truth = load_ground_truth_subset(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}", s1_ids)
     index = pd.Index(s1_ids)
     codes = index.get_indexer(preds["s1_id"])
     ok = codes >= 0

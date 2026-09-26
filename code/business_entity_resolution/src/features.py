@@ -18,18 +18,22 @@ from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
 from .block import candidates_path, partition_decision
 from .cli import parse_split
-from .config import INTERIM_DIR, TRAIN_DIR, ensure_dirs
-from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth
+from .config import INTERIM_DIR, TRAIN_DIR, ensure_dirs, max_mem_gb
+from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth_subset
 from .normalize import records_path
 from .perf import stage_timer
+from .split import load_split_ids
 
 BATCH_PAIRS = 100_000
+OBJECT_BYTES_PER_RECORD = 450  # measured: Python-object string frame of REC_COLUMNS
+OBJECT_LAYOUT_BUDGET_SHARE = 0.35  # use Python-object strings (faster) only if the country's records fit in this share
 RF_WORKERS = int(os.environ.get("ER_RF_WORKERS", "-1"))  # rapidfuzz threads (-1 = all cores)
 REC_COLUMNS = ["entity_id", "name_norm", "name_core", "addr_norm", "numbers", "postcode"]
 SCORERS = {"ratio": fuzz.ratio, "partial": fuzz.partial_ratio, "tsort": fuzz.token_sort_ratio, "tset": fuzz.token_set_ratio}
@@ -231,6 +235,29 @@ def iter_batches(cand_path, batch_pairs: int = BATCH_PAIRS) -> Iterator[Tuple[st
         yield country, pd.concat(pending, ignore_index=True)
 
 
+def load_country_records(path, country: Optional[str], mem_gb: Optional[float] = None) -> pd.DataFrame:
+    """Load the feature-relevant columns of one country's records, in a layout chosen from the memory budget.
+
+    Python-object strings are ~2x faster to score but ~6x bigger than Arrow-backed strings, so the Arrow layout is used
+    when the country's records would take more than ``OBJECT_LAYOUT_BUDGET_SHARE`` of ``ER_MAX_MEM_GB``.
+
+    Args:
+        path: Records parquet.
+        country: Country label (None = all records).
+        mem_gb: Budget in GB (defaults to ``config.max_mem_gb()``).
+
+    Returns:
+        DataFrame with ``REC_COLUMNS``.
+    """
+    mem_gb = max_mem_gb() if mem_gb is None else mem_gb
+    expr = (ds.field("country") == country) if country is not None else None
+    n_rows = ds.dataset(str(path), format="parquet").count_rows(filter=expr)
+    table = ds.dataset(str(path), format="parquet").to_table(columns=REC_COLUMNS, filter=expr)
+    if n_rows * OBJECT_BYTES_PER_RECORD > OBJECT_LAYOUT_BUDGET_SHARE * mem_gb * 1024 ** 3:
+        return table.to_pandas(types_mapper=pd.ArrowDtype)
+    return table.to_pandas()
+
+
 def run_features(split: str) -> int:
     """Compute and write features for every candidate pair of a split.
 
@@ -241,7 +268,7 @@ def run_features(split: str) -> int:
         Number of feature rows written.
     """
     with_label = split != "test"
-    truth = load_ground_truth(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}") if with_label else None
+    truth = load_ground_truth_subset(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}", load_split_ids(split)) if with_label else None
     partitioned = bool(partition_decision(split)["partition_by_country"])
     schema = feature_schema(with_label)
     ensure_dirs()
@@ -251,9 +278,9 @@ def run_features(split: str) -> int:
         for country, cands in iter_batches(candidates_path(split)):
             key = country if partitioned else "*"
             if key != rec_key:  # load the records of one country at a time
-                filters = [("country", "=", country)] if partitioned else None
-                rec = pq.read_table(records_path(split), columns=REC_COLUMNS, filters=filters).to_pandas()
-                index = pd.Index(rec["entity_id"])
+                rec = None  # release the previous country before loading the next one
+                rec = load_country_records(records_path(split), country if partitioned else None)
+                index = pd.Index(rec["entity_id"].to_numpy(dtype=object))
                 rec_key = key
             frame = compute_batch(cands, rec, index)
             if with_label:

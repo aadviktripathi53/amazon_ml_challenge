@@ -131,7 +131,7 @@ def pair_cosine(a: sp.csr_matrix, ia: np.ndarray, b: sp.csr_matrix, ib: np.ndarr
 
 
 def topk_per_row(scores: sp.csr_matrix, k: int):
-    """Top-``k`` entries of every row of a sparse score matrix (ties broken by column index).
+    """Top-``k`` entries of every row of a sparse score matrix (ties broken by lowest column index, deterministically).
 
     Args:
         scores: CSR matrix ``(n_query, n_pool)`` of similarity scores (zeros are absent).
@@ -148,7 +148,13 @@ def topk_per_row(scores: sp.csr_matrix, k: int):
             continue
         d, c = data[lo:hi], indices[lo:hi]
         if hi - lo > k:
-            keep = np.argpartition(-d, k - 1)[:k]
+            # deterministic top-k: everything above the k-th score, then the LOWEST column indices among the ties at
+            # the boundary (argpartition alone would pick an arbitrary tied subset, making results depend on layout)
+            kth = np.partition(d, len(d) - k)[len(d) - k]
+            above = np.flatnonzero(d > kth)
+            tied = np.flatnonzero(d == kth)
+            tied = tied[np.argsort(c[tied], kind="stable")][: k - len(above)]
+            keep = np.concatenate([above, tied])
             d, c = d[keep], c[keep]
         order = np.lexsort((c, -d))
         n = len(order)

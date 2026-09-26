@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -130,3 +130,39 @@ def load_split(data_dir=None, with_truth: Optional[bool] = None, split: Optional
         with_truth = truth_path.exists()
     truth = load_ground_truth(truth_path) if with_truth else None
     return s1, s2, s3, truth
+
+
+def load_ground_truth_subset(path, s1_ids: Iterable[str], chunksize: int = 200_000) -> Dict[str, Set[str]]:
+    """Ground truth of selected S1 ids only, read in chunks (memory ~ the subset, not the whole file).
+
+    Args:
+        path: Ground-truth TSV.
+        s1_ids: S1 ids to keep.
+        chunksize: Rows per chunk.
+
+    Returns:
+        ``{s1_id: {matched ids}}`` for the requested ids that occur in the file.
+    """
+    wanted = set(s1_ids)
+    out: Dict[str, Set[str]] = {}
+    for chunk in pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, quoting=csv.QUOTE_NONE, chunksize=chunksize):
+        sub = chunk[chunk[TRUTH_ID_COL].isin(wanted)]
+        for eid, matched in zip(sub[TRUTH_ID_COL], sub[MATCHED_COL]):
+            out[eid] = parse_id_list(matched)
+    return out
+
+
+def ground_truth_has_matches(path, chunksize: int = 200_000) -> Dict[str, bool]:
+    """``{s1_id: has at least one match}`` for the whole ground truth, without parsing the id lists.
+
+    Args:
+        path: Ground-truth TSV.
+        chunksize: Rows per chunk.
+
+    Returns:
+        Dict with one bool per S1 (False = singleton); ~100 bytes per S1.
+    """
+    out: Dict[str, bool] = {}
+    for chunk in pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, quoting=csv.QUOTE_NONE, chunksize=chunksize):
+        out.update(zip(chunk[TRUTH_ID_COL], chunk[MATCHED_COL].str.strip() != ""))
+    return out

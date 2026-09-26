@@ -24,13 +24,14 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
 
 from .cli import parse_split
-from .config import INTERIM_DIR, SEED, ensure_dirs
+from .config import INTERIM_DIR, SEED, ensure_dirs, max_mem_gb
 from .features import FEATURE_COLUMNS, features_path
 from .perf import SAMPLE_CAVEAT, save_metrics, stage_timer
 
 MODEL_PATH = INTERIM_DIR / "model.txt"
 N_FOLDS = 5
-MAX_TRAIN_PAIRS = int(os.environ.get("ER_MAX_TRAIN_PAIRS", "20000000"))
+# Default row cap scales with the memory budget (float32 matrix + Arrow table + LightGBM copies ~ 0.8 GB per million rows).
+MAX_TRAIN_PAIRS = int(os.environ.get("ER_MAX_TRAIN_PAIRS") or 1_250_000 * max_mem_gb())
 PARAMS: Dict[str, object] = {
     "objective": "binary", "metric": "binary_logloss", "learning_rate": 0.05, "num_leaves": 63,
     "min_data_in_leaf": 50, "feature_fraction": 0.8, "bagging_fraction": 0.8, "bagging_freq": 1, "lambda_l2": 1.0,

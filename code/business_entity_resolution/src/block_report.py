@@ -14,7 +14,7 @@ import pyarrow.parquet as pq
 from rapidfuzz import fuzz, process
 
 from .config import SEED, TRAIN_DIR
-from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth
+from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth_subset
 from .normalize import records_path
 from .perf import save_metrics
 from .split import load_split_ids
@@ -47,8 +47,32 @@ def stream_recall(cand_path, truth: Dict[str, Set[str]]) -> Tuple[Set[Tuple[str,
     return found, per_s1, n_cand, len(per_s1)
 
 
+def classify_misses(a: pd.DataFrame, b: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """Likely cause of each missed true pair from the raw records of both sides.
+
+    Causes, checked in this order: empty candidate address; non-Latin script on either side's name (transliteration);
+    names very different (token_set_ratio < 50: DBA / trade name / heavy typo); partly different (50-80);
+    otherwise the names are similar and the pair was lost to top-K crowding or n-gram pruning.
+
+    Args:
+        a: S1 records of the missed pairs (``name_raw``, ``addr_raw``, ``name_core``).
+        b: Candidate-side records, same alignment.
+
+    Returns:
+        ``(cause labels, token_set_ratio of the core names)``, both aligned with the pairs.
+    """
+    sim = process.cpdist(a["name_core"].tolist(), b["name_core"].tolist(), scorer=fuzz.token_set_ratio, workers=1)
+    non_latin = np.array([not (x.isascii() and y.isascii()) for x, y in zip(a["name_raw"], b["name_raw"])])
+    kind = np.where(b["addr_raw"].str.strip() == "", "candidate address empty",
+            np.where(non_latin, "non-Latin script name (transliteration)",
+            np.where(sim < 50, "names very different (DBA / trade name / heavy typo)",
+            np.where(sim < 80, "names partly different (token_set_ratio 50-80)",
+                     "names similar (>=80) but not retrieved (top-K crowding / pruning)"))))
+    return kind, sim
+
+
 def describe_misses(missed: List[Tuple[str, str]], rec_path) -> None:
-    """Print a breakdown of missed true pairs and ``N_EXAMPLES`` random examples.
+    """Print a breakdown of missed true pairs by likely cause, then ``N_EXAMPLES`` examples grouped by cause.
 
     Args:
         missed: True pairs not present in the candidates.
@@ -60,17 +84,19 @@ def describe_misses(missed: List[Tuple[str, str]], rec_path) -> None:
                         filters=[("entity_id", "in", ids)]).to_pandas().set_index("entity_id")
     a = rec.loc[[m[0] for m in missed]].reset_index()
     b = rec.loc[[m[1] for m in missed]].reset_index()
-    sim = process.cpdist(a["name_core"].tolist(), b["name_core"].tolist(), scorer=fuzz.token_set_ratio, workers=1)
-    kind = np.where(b["addr_raw"].str.strip() == "", "candidate address empty",
-                    np.where(sim < 50, "names very different (score<50: DBA / transliteration / heavy typo)",
-                             np.where(sim < 80, "names partly different (50-80)", "names similar (>=80) but not retrieved")))
-    print("missed true pairs by kind / by source:")
-    for label, n in Counter(kind).most_common():
+    kind, sim = classify_misses(a, b)
+    counts = Counter(kind)
+    print(f"missed true pairs ({len(missed)}) by likely cause:")
+    for label, n in counts.most_common():
         print(f"   {label}: {n} ({n / len(missed):.1%})")
     print("   by candidate source:", dict(Counter(b["source"])))
-    print(f"{min(N_EXAMPLES, len(missed))} example missed pairs (S1 -> candidate | token_set_ratio):")
-    for i in rng.choice(len(missed), size=min(N_EXAMPLES, len(missed)), replace=False):
-        print(f"   {a['name_raw'][i]!r} @ {a['addr_raw'][i]!r}\n      -> {b['entity_id'][i]} {b['name_raw'][i]!r} @ {b['addr_raw'][i]!r} | {sim[i]:.0f}")
+    per_cause = {label: max(1, round(N_EXAMPLES * n / len(missed))) for label, n in counts.items()}
+    print(f"example missed pairs (about {N_EXAMPLES}, grouped by cause; S1 -> candidate | token_set_ratio):")
+    for label, _ in counts.most_common():
+        pool = np.flatnonzero(kind == label)
+        print(f"  [{label}]")
+        for i in rng.choice(pool, size=min(per_cause[label], len(pool)), replace=False):
+            print(f"   {a['name_raw'][i]!r} @ {a['addr_raw'][i]!r}\n      -> {b['entity_id'][i]} {b['name_raw'][i]!r} @ {b['addr_raw'][i]!r} | {sim[i]:.0f}")
 
 
 def report_blocking(split: str, cand_path: Optional[str] = None) -> Dict[str, object]:
@@ -87,8 +113,7 @@ def report_blocking(split: str, cand_path: Optional[str] = None) -> Dict[str, ob
 
     cand_path = cand_path or candidates_path(split)
     s1_ids = load_split_ids(split)
-    full_truth = load_ground_truth(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}")
-    truth = {s: full_truth[s] for s in s1_ids}
+    truth = load_ground_truth_subset(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}", s1_ids)
     rec_path = records_path(split)
     s1_rec = pq.read_table(rec_path, columns=["entity_id", "country"], filters=[("source", "=", "S1")]).to_pandas()
     country_of = dict(zip(s1_rec["entity_id"], s1_rec["country"]))

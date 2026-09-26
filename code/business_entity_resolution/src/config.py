@@ -8,6 +8,8 @@ Every module imports its paths from here; nothing else hard-codes a path.
 * ``INTERIM_DIR`` ``<repo_root>/data/interim``.
 * ``OUTPUT_DIR``  ``<repo_root>/output``.
 * ``SEED``        42.
+* ``ER_MAX_MEM_GB``      memory budget in GB for the pipeline's big stages (default 8), see ``max_mem_gb``.
+* ``ER_TRAIN_S1_FRAC``   fraction (0-1] of TRAIN S1 ids used for train/val (default 1.0), see ``train_s1_frac``.
 * ``REPORTS_DIR`` ``<repo_root>/reports``; ``FAKE_DATA_DIR`` ``<repo_root>/dataset_fake``;
   ``SAMPLE_DIR`` ``<repo_root>/dataset_sample`` (generated, git-ignored).
 """
@@ -82,6 +84,39 @@ def split_dir(split: str) -> Path:
         ``DATA_DIR/test`` for ``"test"``, otherwise ``DATA_DIR/train``.
     """
     return TEST_DIR if split == "test" else TRAIN_DIR
+
+
+def max_mem_gb(env: "os._Environ[str] | dict" = os.environ) -> float:
+    """Memory budget (GB) for the memory-bounded stages, from ``ER_MAX_MEM_GB`` (default 8).
+
+    Blocking sizes its pool shards and query blocks from it, features chooses its record layout from it and
+    training derives its default row cap from it.
+
+    Args:
+        env: Environment mapping to read from.
+
+    Returns:
+        Budget in gigabytes (> 0).
+    """
+    value = float(env.get("ER_MAX_MEM_GB", "").strip() or 8.0)
+    if value <= 0:
+        raise ValueError("ER_MAX_MEM_GB must be positive")
+    return value
+
+
+def train_s1_frac(env: "os._Environ[str] | dict" = os.environ) -> float:
+    """Fraction of TRAIN S1 ids used for train/val, from ``ER_TRAIN_S1_FRAC`` (default 1.0).
+
+    Args:
+        env: Environment mapping to read from.
+
+    Returns:
+        A value in (0, 1].
+    """
+    value = float(env.get("ER_TRAIN_S1_FRAC", "").strip() or 1.0)
+    if not 0 < value <= 1:
+        raise ValueError("ER_TRAIN_S1_FRAC must be in (0, 1]")
+    return value
 
 
 def ensure_dirs() -> None:

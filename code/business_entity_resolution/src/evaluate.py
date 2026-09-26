@@ -156,14 +156,13 @@ def evaluate_split(split: str = "val") -> Dict[str, object]:
     from .block import candidates_path
     from .config import TRAIN_DIR
     from .decide import matches_path
-    from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth
+    from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth_subset
     from .normalize import records_path
     from .perf import SAMPLE_CAVEAT, save_metrics
     from .split import load_split_ids
 
     s1_ids = load_split_ids(split)
-    full_truth = load_ground_truth(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}")
-    truth = {s: full_truth[s] for s in s1_ids}
+    truth = load_ground_truth_subset(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}", s1_ids)
     candidates = _pairs_to_dict(candidates_path(split))
     predictions = _pairs_to_dict(matches_path(split))
     base = evaluate(predictions, candidates, truth)

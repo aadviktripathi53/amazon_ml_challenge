@@ -21,8 +21,10 @@ Read with `pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)` (`src.
 ## 0. Split: `data/interim/split.json`
 
 80/20 split of train S1 IDs, seed 42, stratified by (country, singleton flag).
-`{"train": [S1 ids...], "val": [S1 ids...]}`. Produced by `python -m src.split` (no `--split` argument).
-Validation S1s are always searched against the FULL train S2/S3 pool.
+`{"train": [S1 ids...], "val": [S1 ids...], "frac": <ER_TRAIN_S1_FRAC>}`. Produced by `python -m src.split` (no `--split`
+argument). With `ER_TRAIN_S1_FRAC < 1` a stratified (country x singleton) random fraction of the train S1 ids is drawn first
+(seed 42) and only that fraction is split 80/20. Train AND validation S1s are always searched against the FULL train
+S2/S3 pool (realistic hard negatives).
 
 ## 1. normalize -> `data/interim/records_{train,test}.parquet`
 
@@ -62,7 +64,14 @@ partition, S1 chunk); a row group never splits an S1's candidates. `val` S1s are
 
 `data/interim/block_meta.json`: `{country_equal_share, n_true_pairs, partition_by_country}` measured on train
 ground truth (partition by country iff share >= 99.5%); val/test reuse it.
-Env knobs: `ER_CHANNELS` (default `name,ctx,addr`), `ER_N_JOBS`, `ER_BLOCK_CHUNK`.
+`python -m src.block --split train` writes BOTH `candidates_train.parquet` and `candidates_val.parquet` in one pass over the
+pool; `--split val` then does nothing.
+
+Memory bound: `ER_MAX_MEM_GB` (default 8). The S2/S3 pool of each country is streamed in shards sized from the budget;
+per shard and query chunk the top-K is merged into a running global top-K, so memory does not grow with the pool (the
+result is independent of the shard size). The IDF of each channel is fitted once on the whole country partition
+(streaming, hashed n-grams; only document-frequency vectors are kept).
+Env knobs: `ER_MAX_MEM_GB`, `ER_CHANNELS` (default `name,ctx,addr`), `ER_N_JOBS`, `ER_BLOCK_CHUNK`.
 
 ## 3. features -> `data/interim/features_{split}.parquet`
 
@@ -82,7 +91,8 @@ Same rows and order as `candidates_{split}.parquet`.
 | `prob` | float32 | match probability (`preds_train`: OUT-OF-FOLD, 5-fold GroupKFold by `s1_id`) |
 | `label` | int8 | `preds_train` only |
 
-`model.txt` = final LightGBM model (`save_model`), refit on all train rows.
+`model.txt` = final LightGBM model (`save_model`), refit on all train rows. Row cap on training pairs: `ER_MAX_TRAIN_PAIRS`
+(default 1.25M x `ER_MAX_MEM_GB`); above it whole S1 groups are sampled (seed 42).
 
 ## 5. decide -> `threshold.json`, `matches_{split}.parquet`
 

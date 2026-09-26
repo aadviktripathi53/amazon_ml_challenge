@@ -5,8 +5,8 @@ appends a record to ``data/interim/stage_metrics.jsonl``. Stages also save their
 (blocking recall, AUC, threshold, F0.5, ...) with ``save_metrics`` so ``src.summary`` (called by
 ``run_all.sh``) can print one table at the end.
 
-Peak memory is the process high-water mark (``ru_maxrss``) of the stage's own process. Forked worker
-processes (``ER_N_JOBS``) are not included, so a parallel run uses more than reported.
+Peak memory is the process high-water mark (``ru_maxrss``) of the stage's own process; ``worker_peak_mb`` is the
+largest forked worker (``ER_N_JOBS``), whose memory is additional (mostly shared copy-on-write).
 """
 from __future__ import annotations
 
@@ -55,7 +55,10 @@ def stage_timer(stage: str, split: str = "-", extra: Optional[Dict[str, Any]] = 
         yield info
     finally:
         seconds = time.perf_counter() - start
-        record = {"stage": stage, "split": split, "seconds": round(seconds, 2), "peak_mb": round(peak_rss_mb(), 1), **info}
+        children = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+        children_mb = children / (1024 * 1024) if sys.platform == "darwin" else children / 1024
+        record = {"stage": stage, "split": split, "seconds": round(seconds, 2), "peak_mb": round(peak_rss_mb(), 1),
+                  "worker_peak_mb": round(children_mb, 1), **info}
         print(f"[{stage}:{split}] done in {seconds:.1f}s, peak RSS {record['peak_mb']:.0f} MB", flush=True)
         ensure_dirs()
         with open(INTERIM_DIR / STAGE_LOG, "a", encoding="utf-8") as fh:

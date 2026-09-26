@@ -7,8 +7,8 @@ from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import numpy as np
 import pandas as pd
 
-from .config import INTERIM_DIR, SEED, TRAIN_DIR, ensure_dirs
-from .io_utils import COUNTRY_COL, GROUND_TRUTH_SUFFIX, ID_COL, SOURCE_SUFFIXES, load_ground_truth, read_tsv
+from .config import INTERIM_DIR, SEED, TRAIN_DIR, ensure_dirs, train_s1_frac
+from .io_utils import COUNTRY_COL, GROUND_TRUTH_SUFFIX, ID_COL, SOURCE_SUFFIXES, ground_truth_has_matches, read_tsv
 from .perf import stage_timer
 
 VAL_FRAC = 0.2
@@ -61,6 +61,49 @@ def make_split(
     return sorted(train_ids), sorted(val_ids)
 
 
+_NO_MATCH: frozenset = frozenset()
+_HAS_MATCH: frozenset = frozenset({"<match>"})
+
+
+def sample_s1_fraction(
+    source1: pd.DataFrame,
+    has_match: Mapping[str, bool],
+    frac: float,
+    seed: int = SEED,
+    id_col: str = ID_COL,
+    country_col: str = COUNTRY_COL,
+) -> pd.DataFrame:
+    """Stratified random fraction of the S1 rows (strata = country x singleton flag).
+
+    Each stratum keeps ``round(frac * size)`` rows, but at least one row when the stratum is non-empty, chosen with a
+    seeded RNG after sorting by id (so the result does not depend on row order).
+
+    Args:
+        source1: S1 DataFrame with ``id_col`` and ``country_col``.
+        has_match: ``{s1_id: True if the S1 has at least one true match}``.
+        frac: Fraction in (0, 1]; 1.0 returns ``source1`` unchanged.
+        seed: RNG seed.
+        id_col: S1 id column.
+        country_col: Country column.
+
+    Returns:
+        The sampled rows (a copy), sorted by id.
+    """
+    if frac >= 1.0:
+        return source1
+    strata: Dict[Tuple[str, bool], List[int]] = {}
+    ordered = source1.sort_values(id_col).reset_index(drop=True)
+    for pos, (eid, country) in enumerate(zip(ordered[id_col], ordered[country_col])):
+        strata.setdefault((country, not has_match[eid]), []).append(pos)
+    rng = np.random.RandomState(seed)
+    keep: List[int] = []
+    for key in sorted(strata):
+        rows = strata[key]
+        n = max(1, int(np.floor(len(rows) * frac + 0.5)))
+        keep.extend(np.array(rows)[rng.permutation(len(rows))[:n]].tolist())
+    return ordered.iloc[sorted(keep)].reset_index(drop=True)
+
+
 def load_split_ids(split: str) -> Optional[List[str]]:
     """Return the S1 ids of a pipeline split, or None for ``test`` (which uses every S1 of the test file).
 
@@ -84,21 +127,25 @@ def load_split_ids(split: str) -> Optional[List[str]]:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """Create ``data/interim/split.json`` from the train S1 file and ground truth (80/20, seed 42).
 
-    Validation S1s are later matched against the FULL train S2/S3 pool (see ``src.block``); the split
-    only decides which S1 ids are used for training and which for validation.
+    With ``ER_TRAIN_S1_FRAC < 1`` a stratified (country x singleton) random fraction of the train S1 ids is drawn first
+    (seed 42) and only that fraction is split 80/20. Blocking still searches the FULL train S2/S3 pool for those S1s,
+    so negatives are realistic hard negatives.
 
     Args:
         argv: Unused (the stage takes no arguments); kept for a uniform ``main`` signature.
     """
     with stage_timer("split"):
-        s1 = read_tsv(TRAIN_DIR / f"train_{SOURCE_SUFFIXES[0]}")  # only S1 + truth: S2/S3 are not needed here
-        truth = load_ground_truth(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}")
-        train_ids, val_ids = make_split(s1, truth)
+        s1 = read_tsv(TRAIN_DIR / f"train_{SOURCE_SUFFIXES[0]}")  # only S1 + truth flags: S2/S3 are not needed here
+        has_match = ground_truth_has_matches(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}")
+        frac = train_s1_frac()
+        s1 = sample_s1_fraction(s1, has_match, frac)
+        truth_like = {eid: (_HAS_MATCH if has_match[eid] else _NO_MATCH) for eid in s1[ID_COL]}  # make_split only needs emptiness
+        train_ids, val_ids = make_split(s1, truth_like)
         ensure_dirs()
         with open(SPLIT_PATH, "w", encoding="utf-8") as fh:
-            json.dump({"train": train_ids, "val": val_ids}, fh)
-        n_single = sum(1 for e in val_ids if not truth[e])
-        print(f"split: {len(train_ids)} train S1, {len(val_ids)} val S1 ({n_single} val singletons) -> {SPLIT_PATH}")
+            json.dump({"train": train_ids, "val": val_ids, "frac": frac}, fh)
+        n_single = sum(1 for e in val_ids if not has_match[e])
+        print(f"split: S1 fraction {frac}: {len(train_ids)} train S1, {len(val_ids)} val S1 ({n_single} val singletons) -> {SPLIT_PATH}")
 
 
 if __name__ == "__main__":
