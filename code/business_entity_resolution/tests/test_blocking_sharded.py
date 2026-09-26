@@ -41,14 +41,14 @@ def records_path(tmp_path):
     return path
 
 
-def run_partition(path, country, shard_docs, n_jobs=1, query_rows=None):
+def run_partition(path, country, shard_docs, n_jobs=1, query_rows=None, rerank=True):
     """Blocking of one partition through the real sharded code path; returns the candidate frame."""
     idf = B.fit_idf(path, country)
     q = pd.concat([B.to_frame(b) for b in B.iter_partition_batches(path, country, ("S1",), ["entity_id", "country", "source", *B.TEXT_COLUMNS])], ignore_index=True)
     if query_rows is not None:
         q = q.iloc[query_rows].reset_index(drop=True)
     block = B.build_query_block(q, np.zeros(len(q), np.int8), idf)
-    states, pool_ids = B.block_query_block(path, country, block, idf, B.Budget(shard_docs, 10 ** 6), n_jobs, "test")
+    states, pool_ids = B.block_query_block(path, country, block, idf, B.Budget(shard_docs, 10 ** 6), n_jobs, "test", rerank=rerank)
     return B.emit_candidates(block, states, pool_ids, 0, len(block.ids)).to_pandas(), idf, block, states
 
 
@@ -71,15 +71,15 @@ def test_parallel_workers_give_the_same_result(records_path, monkeypatch):
 
 
 def test_merged_topk_matches_brute_force(records_path, monkeypatch):
-    """The merged per-shard top-K scores equal a dense brute-force top-K over the whole S2 pool (name channel)."""
+    """The merged per-shard top-K' (retrieval, before rerank) equals a dense brute-force top-K' over the S2 pool."""
     monkeypatch.setattr(B, "BATCH_ROWS", 7)
-    _, idf, block, states = run_partition(records_path, "US", 20)
+    _, idf, block, states = run_partition(records_path, "US", 20, rerank=False)
     pool = pd.concat([B.to_frame(b) for b in B.iter_partition_batches(records_path, "US", ("S2",), ["entity_id", "source", *B.TEXT_COLUMNS])], ignore_index=True)
     from src.tfidf import hashed_counts, tfidf_weight
 
     x = tfidf_weight(hashed_counts(B.channel_text(pool, "name")), idf.idf["name"])
     dense = (block.search["name"] @ prune_common(x, idf.df["name"], idf.max_df).T).toarray()
-    k = B.CHANNELS["name"]
+    k = B.retrieve_k("name")
     expected = -np.sort(-dense, axis=1)[:, :k]
     got = states[("name", "S2")].score
     np.testing.assert_allclose(np.where(got < 0, 0, got), expected, atol=1e-6)  # empty slots (score -1) are zeros in the dense result
@@ -205,3 +205,48 @@ def test_rare_fallback_helper():
     assert n0 == 0 and (same != pruned).nnz == 0
     pool = prune_common(x, df, 500, keep=exempt)  # the pool side keeps the exempt buckets
     assert set(pool[0].indices) == {11, 12, 13} | ({10} & set())  # 10 (df 900) is not exempt here
+
+
+def test_rerank_keeps_k_sorted_by_exact_cosine(records_path):
+    """After rerank every (channel, source) has K slots whose rerank key is non-increasing."""
+    _, _, _, states = run_partition(records_path, "US", 30)
+    for (ch, _src), st in states.items():
+        assert st.idx.shape[1] == B.CHANNELS[ch]
+        key = np.nan_to_num(st.cos[:, :, B.ENABLED.index(ch)], nan=0.0)
+        if ch in B.ADDR_TIEBREAK_CHANNELS:
+            key = key + B.ADDR_TIEBREAK_WEIGHT * np.nan_to_num(st.cos[:, :, B.ENABLED.index("addr")], nan=0.0)
+        for row_key, row_idx in zip(key, st.idx):
+            filled = row_key[row_idx >= 0]
+            assert (np.diff(filled) <= 1e-6).all() and (row_idx[len(filled):] == -1).all()  # sorted, empty slots last
+
+
+def _duplicate_name_corpus(n_dup):
+    """One query 'ridgeline' at a Waxahachie address; ``n_dup`` identical names elsewhere; the true record last."""
+    rows = [("S1-q", "S1", "US", "ridgeline", "", "waxahachie", "152 north grove boulevard waxahachie tx")]
+    streets = ["oak lane", "pine road", "elm court", "maple drive", "cedar way", "birch avenue", "lake street", "hill road"]
+    for i in range(n_dup):
+        rows.append((f"S2-{i}", "S2", "US", "ridgeline", "", "dallas", f"{100 + i} {streets[i % 8]} dallas tx"))
+    rows.append(("S2-true", "S2", "US", "ridgeline", "", "waxahachie", "152 north grove boulevard waxahachie texas"))
+    rows.append(("S3-0", "S3", "US", "other name", "", "x", "1 road x"))
+    return pd.DataFrame(rows, columns=["entity_id", "source", "country", "name_core", "postcode", "city_token", "addr_norm"])
+
+
+def test_address_tiebreak_ranks_matching_address_first(tmp_path, monkeypatch):
+    """With fewer identical names than K', the one at the query's address is ranked 1st on the name channel."""
+    path = tmp_path / "records.parquet"
+    pq.write_table(pa.Table.from_pandas(_duplicate_name_corpus(40), preserve_index=False), path, row_group_size=13)
+    table, *_ = run_partition(path, "US", 20)
+    top = table[table.ch_name].sort_values("rank_name")
+    assert top.iloc[0]["cand_id"] == "S2-true" and len(top) <= B.CHANNELS["name"]
+    monkeypatch.setattr(B, "ADDR_TIEBREAK_WEIGHT", 0.0)
+    plain, *_ = run_partition(path, "US", 20)
+    assert plain[plain.ch_name].sort_values("rank_name").iloc[0]["cand_id"] != "S2-true"  # all names tie -> lowest index wins
+
+
+def test_more_duplicates_than_k_prime_are_recovered_by_ctx(tmp_path):
+    """Known limit: with more identical names than K' the name channel cannot see the true one; ctx (name+city) does."""
+    path = tmp_path / "records.parquet"
+    pq.write_table(pa.Table.from_pandas(_duplicate_name_corpus(3 * B.retrieve_k("name")), preserve_index=False), path, row_group_size=13)
+    table, *_ = run_partition(path, "US", 50)
+    true_row = table[table.cand_id == "S2-true"]
+    assert len(true_row) == 1 and bool(true_row["ch_ctx"].iloc[0])

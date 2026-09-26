@@ -4,6 +4,12 @@
 #   ER_DATA_DIR=dataset bash run_full_test.sh
 # Requires data/interim/{model.txt, threshold.json, block_meta.json} from the train side. Knobs: ER_MAX_MEM_GB (default 8),
 # ER_N_JOBS (blocking workers), VALIDATE_IDS=1 (also run the validator's ID-existence check, ~2 GB more memory).
+#
+# Estimate for the FULL test set (1.73M S1, 10.0M S2+S3; config: rerank + address tiebreak, ER_MAX_MEM_GB=8, ER_N_JOBS=4),
+# extrapolated from the realistic-5% train-side run (110k queries vs 10.3M pool: block 540 s, 4.6 GB peak) - NOT measured:
+#   normalize ~2-3 min (~1.2 GB) | block ~40-75 min (~6-7 GB: query blocks of ~268k S1, so India needs ~4 passes over its
+#   pool) | features ~30-50 min (~6 GB; ~109M pairs) | predict ~15-20 min (~1.1 GB) | decide + write_submission +
+#   validator ~5-10 min (~3 GB)  =>  total ~1.5-2.5 h, peak ~6-7 GB (closest to the 8 GB budget in block).
 set -euo pipefail
 cd "$(dirname "$0")"
 PY="${PYTHON:-python}"

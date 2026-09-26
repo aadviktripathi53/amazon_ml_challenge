@@ -19,7 +19,9 @@ Memory bound (``ER_MAX_MEM_GB``, default 8): nothing that grows with the pool is
 * for each shard every S1 query chunk is multiplied against it (sparse x sparse, pruned of very common n-grams, never
   dense), the shard's top-K per query is extracted, and it is MERGED into the running global top-K of that
   (channel, source); exact cosines (all channels) are computed only for entries that entered the running top-K;
-* the running top-K state is ``n_queries x K`` arrays, so memory depends on the number of queries in a block (also
+* retrieval keeps ``K' = 4 x K`` per (channel, source) by the pruned score; after the last shard the K' are reranked by
+  EXACT cosine (name/ctx: + ``ADDR_TIEBREAK_WEIGHT`` x exact address cosine) and the top K are kept;
+* the running top-K' state is ``n_queries x K'`` arrays, so memory depends on the number of queries in a block (also
   bounded by the budget), not on the pool size.
 
 The result is identical for any shard size (unit-tested). Chunks of one shard are independent, so ``ER_N_JOBS=<n>`` runs
@@ -65,7 +67,10 @@ BATCH_ROWS = 100_000  # rows per streamed record batch
 MAX_DF_FRAC = 0.002  # n-gram pruned from the SEARCH matrices when in > this share of the partition's documents ...
 MAX_DF_FLOOR = 500  # ... but never below this many documents
 RARE_FALLBACK_N = int(os.environ.get("ER_RARE_FALLBACK_N", "5"))  # rarest n-grams a zero-survivor query row gets back (0 = off)
-RARE_FALLBACK_CHANNELS = ("name", "ctx")  # channels the fallback applies to
+RARE_FALLBACK_CHANNELS = ("name", "ctx", "addr")  # channels the fallback applies to
+RETRIEVE_MULT = int(os.environ.get("ER_RETRIEVE_MULT", "4"))  # K' = RETRIEVE_MULT x K retrieved by pruned score, reranked to K
+ADDR_TIEBREAK_WEIGHT = float(os.environ.get("ER_ADDR_TIEBREAK_W", "0.5"))  # name/ctx rerank key = exact cos + w x exact addr cos
+ADDR_TIEBREAK_CHANNELS = ("name", "ctx")
 COUNTRY_EQUAL_MIN = 0.995
 META_PATH = INTERIM_DIR / "block_meta.json"
 TEXT_COLUMNS = ["name_core", "postcode", "city_token", "addr_norm"]
@@ -74,7 +79,7 @@ SOURCES = ("S2", "S3")
 # Budget model: bytes per document per channel, measured with tracemalloc on the sample (exact + pruned/transposed
 # matrices + transients, x2 safety) and the share of the budget given to each consumer.
 SHARD_BYTES_PER_DOC_PER_CHANNEL = 1500
-QUERY_BYTES_PER_QUERY = 2600  # exact + pruned query matrices + 2 sources x sum(K) x (idx, score, 3 cosines)
+QUERY_BYTES_PER_QUERY = 8000  # exact + pruned query matrices + 2 sources x sum(K') x (idx, score, 3 cosines) + merge temporaries
 SHARD_BUDGET_SHARE = 0.35
 QUERY_BUDGET_SHARE = 0.25
 
@@ -409,6 +414,42 @@ class TopK:
     cos: np.ndarray
 
 
+def retrieve_k(channel: str) -> int:
+    """Number of candidates kept per (channel, source) during the shard merge: ``K' = RETRIEVE_MULT x K``.
+
+    Args:
+        channel: Channel name.
+
+    Returns:
+        K'.
+    """
+    return RETRIEVE_MULT * CHANNELS[channel]
+
+
+def rerank_topk(state: TopK, channel: str) -> TopK:
+    """Rerank the K' retrieved entries of one (channel, source) by EXACT similarity and keep the top K.
+
+    Key: the channel's exact cosine (full, unpruned vectors); for the ``name`` and ``ctx`` channels plus
+    ``ADDR_TIEBREAK_WEIGHT`` x the exact address cosine (0 when either address is empty or the address channel is off),
+    so that among many identical names the one at the matching address ranks first. Ties keep the retrieval order.
+
+    Args:
+        state: Running top-K' after all shards (every entry already has exact cosines).
+        channel: Channel name.
+
+    Returns:
+        ``TopK`` with K slots per query, sorted by the rerank key (empty slots, idx -1, last).
+    """
+    k = CHANNELS[channel]
+    key = np.nan_to_num(state.cos[:, :, ENABLED.index(channel)], nan=0.0).astype(np.float32)
+    if channel in ADDR_TIEBREAK_CHANNELS and "addr" in ENABLED and ADDR_TIEBREAK_WEIGHT:
+        key = key + ADDR_TIEBREAK_WEIGHT * np.nan_to_num(state.cos[:, :, ENABLED.index("addr")], nan=0.0)
+    key = np.where(state.idx >= 0, key, -np.inf)
+    order = np.argsort(-key, axis=1, kind="stable")[:, :k]
+    return TopK(np.take_along_axis(state.idx, order, axis=1), np.take_along_axis(state.score, order, axis=1),
+                np.take_along_axis(state.cos, order[:, :, None], axis=1))
+
+
 def empty_topk(n_queries: int, k: int) -> TopK:
     """An empty running top-K.
 
@@ -439,7 +480,7 @@ def _search_range(bounds: Tuple[int, int]) -> Tuple[int, Dict[str, Tuple[np.ndar
     query_search, shard_t = _CTX
     out = {}
     for ch in ENABLED:
-        k = CHANNELS[ch]
+        k = retrieve_k(ch)
         row, col, val, rank = topk_per_row((query_search[ch][a:b] @ shard_t[ch]).tocsr(), k)
         idx = np.full((b - a, k), -1, np.int32)
         score = np.full((b - a, k), -1.0, np.float32)
@@ -464,7 +505,7 @@ def search_shard(block: QueryBlock, shard: Shard, n_jobs: int, chunk_rows: Optio
     global _CTX
     chunk_rows = chunk_rows or CHUNK_ROWS
     n = len(block.ids)
-    out = {ch: (np.full((n, CHANNELS[ch]), -1, np.int32), np.full((n, CHANNELS[ch]), -1.0, np.float32)) for ch in ENABLED}
+    out = {ch: (np.full((n, retrieve_k(ch)), -1, np.int32), np.full((n, retrieve_k(ch)), -1.0, np.float32)) for ch in ENABLED}
     ranges = [(a, min(a + chunk_rows, n)) for a in range(0, n, chunk_rows)]
     _CTX = (block.search, shard.search_t)
     try:
@@ -564,7 +605,8 @@ def emit_candidates(block: QueryBlock, states: Dict[Tuple[str, str], TopK], pool
     return pa.Table.from_pandas(frame[CANDIDATE_SCHEMA.names], schema=CANDIDATE_SCHEMA, preserve_index=False)
 
 
-def block_query_block(path, country: Optional[str], block: QueryBlock, idf: Idf, budget: Budget, n_jobs: int, label: str) -> Tuple[Dict, Dict]:
+def block_query_block(path, country: Optional[str], block: QueryBlock, idf: Idf, budget: Budget, n_jobs: int, label: str,
+                      rerank: bool = True) -> Tuple[Dict, Dict]:
     """Run all pool shards of both sources against one query block and return the final top-K states.
 
     Args:
@@ -575,12 +617,14 @@ def block_query_block(path, country: Optional[str], block: QueryBlock, idf: Idf,
         budget: Shard sizing.
         n_jobs: Forked workers for the sparse products.
         label: Text used in progress lines.
+        rerank: Rerank the retrieved K' to the final K by exact similarity (``rerank_topk``); False returns the raw
+            top-K' by pruned score (used by tests).
 
     Returns:
         ``(states {(channel, source): TopK}, pool_ids {source: Arrow id array of the whole pool})``.
     """
     n = len(block.ids)
-    states = {(ch, s): empty_topk(n, CHANNELS[ch]) for ch in ENABLED for s in SOURCES}
+    states = {(ch, s): empty_topk(n, retrieve_k(ch)) for ch in ENABLED for s in SOURCES}
     pool_ids: Dict[str, List[pa.Array]] = {s: [] for s in SOURCES}
     for src in SOURCES:
         for i, shard in enumerate(iter_shards(path, country, src, budget.shard_docs, idf, block.exempt)):
@@ -592,6 +636,8 @@ def block_query_block(path, country: Optional[str], block: QueryBlock, idf: Idf,
             print(f"block: {label} {src} shard {i} ({len(shard.ids)} docs, offset {shard.offset}) searched by {n} queries in "
                   f"{time.perf_counter() - t0:.1f}s, peak RSS {peak_rss_mb():.0f} MB", flush=True)
             del shard, res
+    if rerank:
+        states = {(ch, s): rerank_topk(st, ch) for (ch, s), st in states.items()}
     return states, {s: pa.concat_arrays(v) if v else pa.array([], pa.string()) for s, v in pool_ids.items()}
 
 
@@ -611,7 +657,8 @@ def run_block(splits: Sequence[str], n_jobs: int = 1, budget: Optional[Budget] =
     meta = partition_decision(splits[0])
     print(f"block: true pairs with equal country label = {meta['country_equal_share']:.4%} "
           f"({meta['n_true_pairs']} pairs) -> partition by country: {meta['partition_by_country']}")
-    print(f"block: memory budget {max_mem_gb():.1f} GB -> shards of {budget.shard_docs} docs, query blocks of {budget.query_block}, channels {ENABLED}")
+    print(f"block: memory budget {max_mem_gb():.1f} GB -> shards of {budget.shard_docs} docs, query blocks of {budget.query_block}, channels {ENABLED}, "
+          f"K'={RETRIEVE_MULT}xK reranked by exact cosine (+{ADDR_TIEBREAK_WEIGHT} x addr cosine for {list(ADDR_TIEBREAK_CHANNELS)})")
     path = path or records_path(splits[0])
     id_to_code: Optional[Dict[str, int]] = None
     if splits[0] != "test":

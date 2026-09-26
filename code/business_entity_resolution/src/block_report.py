@@ -44,9 +44,12 @@ def stream_recall(cand_path, truth: Dict[str, Set[str]]) -> Tuple[Set[Tuple[str,
         s1_list = t.column("s1_id").to_pylist()
         for ch in by_channel:
             flags = t.column(f"ch_{ch}").to_pylist()
-            for s, f in zip(s1_list, flags):
+            cands = t.column("cand_id").to_pylist()
+            for s, c, f in zip(s1_list, cands, flags):
                 if f:
                     by_channel[ch][s] += 1
+                    if c in truth.get(s, ()):
+                        by_channel[ch]["__true_found__"] += 1
         for s, c in zip(s1_list, t.column("cand_id").to_pylist()):
             if c in truth.get(s, ()):
                 found.add((s, c))
@@ -144,6 +147,7 @@ def report_blocking(split: str, cand_path: Optional[str] = None) -> Dict[str, ob
         "n_s1": len(truth),
         "n_true_pairs": n_true,
         **{f"zero_{ch}_share": sum(1 for x in truth if by_channel[ch][x] == 0) / max(len(truth), 1) for ch in by_channel},
+        "recall_by_channel": {ch: by_channel[ch]["__true_found__"] / max(n_true, 1) for ch in by_channel},
         "zero_any_share": sum(1 for x in truth if all(by_channel[ch][x] == 0 for ch in by_channel)) / max(len(truth), 1),
     }
     print(f"blocking[{split}]: recall {recall:.4f} ({len(found)}/{n_true} true pairs), "
@@ -151,6 +155,7 @@ def report_blocking(split: str, cand_path: Optional[str] = None) -> Dict[str, ob
     print("blocking recall per country:", {c: round(v, 4) for c, v in metrics["recall_by_country"].items()})
     print(f"blocking[{split}]: share of S1 with ZERO candidates from: name {metrics['zero_name_share']:.4f}, ctx {metrics['zero_ctx_share']:.4f}, "
           f"addr {metrics['zero_addr_share']:.4f}, ANY channel {metrics['zero_any_share']:.4f}")
+    print(f"blocking[{split}]: recall per channel (alone): " + ", ".join(f"{c} {v:.4f}" for c, v in metrics["recall_by_channel"].items()))
     if recall < TARGET_RECALL:
         print(f"blocking recall {recall:.4f} < target {TARGET_RECALL}: analysing missed pairs")
         missed = [(s, c) for s, v in truth.items() for c in sorted(v) if (s, c) not in found]
