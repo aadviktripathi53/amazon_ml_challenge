@@ -116,3 +116,108 @@ def evaluate(
         "blocking_recall": blocking_recall(candidates, truth),
         "avg_candidates": avg_candidates_per_entity(candidates, truth.keys()),
     }
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Command line: `python -m src.evaluate --split val`. The metric functions above are unchanged; this only loads the
+# pipeline files and reports macro F0.5 with the extra breakdowns.
+# ---------------------------------------------------------------------------------------------------------------
+def _pairs_to_dict(table_path) -> Dict[str, Set[str]]:
+    """Read an ``(s1_id, cand_id, ...)`` parquet into ``{s1_id: {cand ids}}``, streaming by row group.
+
+    Args:
+        table_path: Parquet path.
+
+    Returns:
+        Mapping from S1 id to the set of its ids.
+    """
+    import pyarrow.parquet as pq
+
+    out: Dict[str, Set[str]] = {}
+    pf = pq.ParquetFile(table_path)
+    for rg in range(pf.num_row_groups):
+        t = pf.read_row_group(rg, columns=["s1_id", "cand_id"])
+        for s, c in zip(t.column("s1_id").to_pylist(), t.column("cand_id").to_pylist()):
+            out.setdefault(s, set()).add(c)
+    return out
+
+
+def evaluate_split(split: str = "val") -> Dict[str, object]:
+    """Evaluate a labelled split: macro F0.5, precision, recall, singleton / non-singleton / per-country F0.5.
+
+    Args:
+        split: ``"val"`` (or ``"train"`` for a sanity check with the OOF-thresholded matches).
+
+    Returns:
+        Metrics dict (also printed and saved to ``data/interim/metrics/evaluate_<split>.json``).
+    """
+    import pyarrow.parquet as pq
+
+    from .block import candidates_path
+    from .config import TRAIN_DIR
+    from .decide import matches_path
+    from .io_utils import GROUND_TRUTH_SUFFIX, load_ground_truth
+    from .normalize import records_path
+    from .perf import SAMPLE_CAVEAT, save_metrics
+    from .split import load_split_ids
+
+    s1_ids = load_split_ids(split)
+    full_truth = load_ground_truth(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}")
+    truth = {s: full_truth[s] for s in s1_ids}
+    candidates = _pairs_to_dict(candidates_path(split))
+    predictions = _pairs_to_dict(matches_path(split))
+    base = evaluate(predictions, candidates, truth)
+
+    n_pred = sum(len(v) for v in predictions.values())
+    n_true = sum(len(v) for v in truth.values())
+    n_correct = sum(len(set(predictions.get(s, ())) & t) for s, t in truth.items())
+    s1_country = pq.read_table(records_path(split), columns=["entity_id", "country"], filters=[("source", "=", "S1")]).to_pandas()
+    country_of = dict(zip(s1_country["entity_id"], s1_country["country"]))
+    by_country: Dict[str, Dict[str, Set[str]]] = {}
+    for s, t in truth.items():
+        by_country.setdefault(country_of.get(s, "?"), {})[s] = t
+    singles = {s: t for s, t in truth.items() if not t}
+    others = {s: t for s, t in truth.items() if t}
+    result = {
+        "macro_f05": base["macro_f05"],
+        "precision_micro": n_correct / n_pred if n_pred else 1.0,
+        "recall_micro": n_correct / n_true if n_true else 1.0,
+        "f05_singletons": macro_fbeta(predictions, singles) if singles else None,
+        "f05_non_singletons": macro_fbeta(predictions, others) if others else None,
+        "f05_by_country": {c: macro_fbeta(predictions, t) for c, t in sorted(by_country.items())},
+        "blocking_recall": base["blocking_recall"],
+        "avg_candidates": base["avg_candidates"],
+        "n_s1": len(truth),
+        "n_singletons": len(singles),
+        "n_predicted_pairs": n_pred,
+    }
+    print(f"evaluate[{split}]: macro F0.5 {result['macro_f05']:.4f} over {len(truth)} S1 "
+          f"(micro precision {result['precision_micro']:.4f}, micro recall {result['recall_micro']:.4f})")
+    print(f"evaluate[{split}]: F0.5 on singletons only {result['f05_singletons']} ({len(singles)} S1), "
+          f"non-singletons only {result['f05_non_singletons']:.4f} ({len(others)} S1)")
+    print(f"evaluate[{split}]: F0.5 per country: {{{', '.join(f'{c}: {v:.4f}' for c, v in result['f05_by_country'].items())}}}")
+    print(f"evaluate[{split}]: blocking recall {result['blocking_recall']:.4f}, avg candidates per S1 {result['avg_candidates']:.1f}")
+    print(SAMPLE_CAVEAT)
+    save_metrics(f"evaluate_{split}", result)
+    return result
+
+
+def main(argv=None) -> None:
+    """Entry point for ``python -m src.evaluate --split val``.
+
+    Args:
+        argv: Argument list (defaults to ``sys.argv[1:]``).
+    """
+    import argparse
+
+    from .perf import stage_timer
+
+    parser = argparse.ArgumentParser(description="Evaluate a labelled split (macro F0.5 and breakdowns).")
+    parser.add_argument("--split", default="val", choices=("val", "train"))
+    split = parser.parse_args(argv).split
+    with stage_timer("evaluate", split):
+        evaluate_split(split)
+
+
+if __name__ == "__main__":
+    main()

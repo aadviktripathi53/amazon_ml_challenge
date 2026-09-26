@@ -1,15 +1,18 @@
 """Deterministic train/validation split of Source 1 entity IDs."""
 from __future__ import annotations
 
-from typing import Dict, List, Mapping, Set, Tuple
+import json
+from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
-from .config import SEED
-from .io_utils import COUNTRY_COL, ID_COL
+from .config import INTERIM_DIR, SEED, TRAIN_DIR, ensure_dirs
+from .io_utils import COUNTRY_COL, GROUND_TRUTH_SUFFIX, ID_COL, SOURCE_SUFFIXES, load_ground_truth, read_tsv
+from .perf import stage_timer
 
 VAL_FRAC = 0.2
+SPLIT_PATH = INTERIM_DIR / "split.json"
 
 
 def make_split(
@@ -56,3 +59,47 @@ def make_split(
         val_ids.extend(ids[i] for i in order[:n_val])
         train_ids.extend(ids[i] for i in order[n_val:])
     return sorted(train_ids), sorted(val_ids)
+
+
+def load_split_ids(split: str) -> Optional[List[str]]:
+    """Return the S1 ids of a pipeline split, or None for ``test`` (which uses every S1 of the test file).
+
+    Args:
+        split: ``"train"``, ``"val"`` or ``"test"``.
+
+    Returns:
+        Sorted S1 id list from ``data/interim/split.json`` for train/val; None for test.
+
+    Raises:
+        FileNotFoundError: If ``split.json`` has not been created (run ``python -m src.split``).
+    """
+    if split == "test":
+        return None
+    if not SPLIT_PATH.exists():
+        raise FileNotFoundError(f"{SPLIT_PATH} not found - run `python -m src.split` first")
+    with open(SPLIT_PATH, encoding="utf-8") as fh:
+        return json.load(fh)[split]
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    """Create ``data/interim/split.json`` from the train S1 file and ground truth (80/20, seed 42).
+
+    Validation S1s are later matched against the FULL train S2/S3 pool (see ``src.block``); the split
+    only decides which S1 ids are used for training and which for validation.
+
+    Args:
+        argv: Unused (the stage takes no arguments); kept for a uniform ``main`` signature.
+    """
+    with stage_timer("split"):
+        s1 = read_tsv(TRAIN_DIR / f"train_{SOURCE_SUFFIXES[0]}")  # only S1 + truth: S2/S3 are not needed here
+        truth = load_ground_truth(TRAIN_DIR / f"train_{GROUND_TRUTH_SUFFIX}")
+        train_ids, val_ids = make_split(s1, truth)
+        ensure_dirs()
+        with open(SPLIT_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"train": train_ids, "val": val_ids}, fh)
+        n_single = sum(1 for e in val_ids if not truth[e])
+        print(f"split: {len(train_ids)} train S1, {len(val_ids)} val S1 ({n_single} val singletons) -> {SPLIT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
