@@ -99,10 +99,18 @@ Same rows and order as `candidates_{split}.parquet`.
 `model.txt` = final LightGBM model (`save_model`), refit on all train rows. Row cap on training pairs: `ER_MAX_TRAIN_PAIRS`
 (default 1.25M x `ER_MAX_MEM_GB`); above it whole S1 groups are sampled (seed 42).
 
-## 5. decide -> `threshold.json`, `matches_{split}.parquet`
+## 5. decide -> `threshold.json`, `calibration.json`, `matches_{split}.parquet`
 
-`threshold.json` (from `decide --split train`): `{threshold, oof_macro_f05, sweep, n_s1}`, threshold chosen on the
-out-of-fold train predictions. `matches_{val,test}.parquet`: `s1_id, cand_id, prob` for pairs with `prob >= threshold`.
+`decide --split train`: `threshold.json` = `{threshold, oof_macro_f05, sweep, n_s1}` (flat threshold chosen on the
+out-of-fold train predictions) and `calibration.json` = isotonic-regression breakpoints `{x, y, brier_raw,
+brier_calibrated}` fitted on the same OOF predictions (applied with `np.interp`).
+`decide --split val|test` -> `matches_{split}.parquet`: `s1_id, cand_id, prob, prob_cal` (raw + calibrated probability).
+Rule `ER_DECISION`: `hybrid` (default: flat threshold decides empty vs non-empty, expected F0.5 over the calibrated
+probabilities chooses how many top candidates), `expf` (expected F0.5 decides everything; k=0 exact, k>=1 Monte Carlo,
+`ER_MC_DRAWS`=2000, seed 42, candidates with p < `ER_MC_MIN_P`=0.001 not simulated) or `threshold` (flat rule).
+Then `ER_EXCLUSIVE=1` (default): a candidate chosen by several S1s is kept only for the highest calibrated probability
+(ties: raw probability, then S1 id). For `val`, the train S1s' OOF decisions take part in that contest.
+Predictions are streamed in S1-complete chunks (an S1's rows are contiguous in `preds_{split}.parquet`).
 
 ## 6. write_submission -> `output/`
 
