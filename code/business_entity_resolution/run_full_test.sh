@@ -10,17 +10,17 @@
 # Knobs: ER_MAX_MEM_GB (default 8), ER_N_JOBS (blocking workers, default 4), VALIDATE_IDS=1 (validator ID-existence
 # check, ~2 GB more memory).
 #
-# ESTIMATE (NOT measured) for 1.73M test S1 vs 10.0M S2+S3, current config (name K'=6xK, rerank + address tiebreak,
-# duplicate-name channel, hybrid decision), ER_MAX_MEM_GB=8, ER_N_JOBS=4, extrapolated from the realistic-5% train side
-# (110k S1 vs 10.3M pool: block 565 s, features 94 s, predict 11 s, decide 8 s) and measured per-query blocking memory:
-#   normalize        ~2-3 min    ~1.2 GB
-#   block            ~45-80 min  ~6.5-7 GB  query blocks of ~193k S1 (measured ~19.8 KB/query at the merge peak), so
-#                                           India 5 / US 4 / France 2 passes over their pools; ~110M candidate pairs
-#   features         ~25-40 min  ~6-6.5 GB  (largest country's records ~2.5 GB in the fast in-memory layout)
-#   predict          ~15-20 min  ~1.1 GB
-#   decide           ~3-5 min    ~2-3 GB    (Monte Carlo ~7 s per 110k S1 measured; exclusivity over ~4-5M kept pairs)
-#   write_submission ~5-10 min   ~3 GB      (10M S2/S3 ids indexed for the existence check)
-#   => total ~1.6-2.7 h, peak ~7 GB (block), within the 8 GB budget but with little slack: close other programs.
+# ESTIMATE (NOT measured) for 1.73M test S1 vs 10.0M S2+S3, exp-v2 final config (blocking unchanged: name K'=6xK, rerank +
+# address tiebreak, duplicate-name channel; features + ER_FEAT_V2 + ER_FEAT_PHON, both on by default; hybrid decision),
+# ER_MAX_MEM_GB=8, ER_N_JOBS=4, extrapolated from the exp-v2 0.2-fraction train side (441k S1 vs 10.3M pool: block 1,282 s,
+# features ~36 us/pair = 1,017 s for 28M pairs, predict 48 s for 5.6M pairs):
+#   normalize        ~3-4 min    ~1.2 GB    (+ phonetic key columns)
+#   block            ~45-80 min  ~6.5-7 GB  India 5 / US 4 / France 2 passes over their pools; ~110M candidate pairs
+#   features         ~55-80 min  ~6.5 GB    (was ~25-40: house-number / IDF / context features are per-pair Python)
+#   predict          ~15-20 min  ~1.5 GB    (batches sized from the budget)
+#   decide           ~3-5 min    ~2-3 GB
+#   write_submission ~5-10 min   ~3 GB
+#   => total ~2.1-3.3 h, peak ~7 GB (block). Needs the exp-v2 train-side artifacts (model trained with the same flags).
 set -euo pipefail
 cd "$(dirname "$0")"
 PY="${PYTHON:-python}"

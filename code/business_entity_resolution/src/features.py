@@ -35,8 +35,8 @@ BATCH_PAIRS = 100_000
 OBJECT_BYTES_PER_RECORD = 450  # measured: Python-object string frame of REC_COLUMNS
 OBJECT_LAYOUT_BUDGET_SHARE = 0.35  # use Python-object strings (faster) only if the country's records fit in this share
 RF_WORKERS = int(os.environ.get("ER_RF_WORKERS", "-1"))  # rapidfuzz threads (-1 = all cores)
-FEAT_PHON = os.environ.get("ER_FEAT_PHON", "0") == "1"  # phonetic-key / consonant-skeleton similarities
-FEAT_V2 = os.environ.get("ER_FEAT_V2", "0") == "1"  # house-number agreement, name rarity, per-S1 context, IDF name mismatch
+FEAT_PHON = os.environ.get("ER_FEAT_PHON", "1") == "1"  # phonetic-key / consonant-skeleton similarities (on by default: +0.0010 val F0.5 at 0.2, paired CI [+0.0007, +0.0014])
+FEAT_V2 = os.environ.get("ER_FEAT_V2", "1") == "1"  # house-number agreement, name rarity, per-S1 context, IDF name mismatch (on by default: +0.0137 val F0.5 at 5%)
 REC_COLUMNS = ["entity_id", "name_norm", "name_core", "addr_norm", "numbers", "postcode"] + (["name_phon", "name_skel"] if FEAT_PHON else [])
 SCORERS = {"ratio": fuzz.ratio, "partial": fuzz.partial_ratio, "tsort": fuzz.token_sort_ratio, "tset": fuzz.token_set_ratio}
 

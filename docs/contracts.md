@@ -91,7 +91,7 @@ Same rows and order as `candidates_{split}.parquet`.
 | Column | Type | Notes |
 |---|---|---|
 | `s1_id`, `cand_id` | str | |
-| 37 feature columns by default; + `ch/rank/cos_phon` and `ch/rank_key` when those channels are on, + `ph_*`/`sk_*` (`ER_FEAT_PHON=1`), + `house_state`, `num_near`, `core_freq_*`, `name_idf_*`, `s1_*` context (`ER_FEAT_V2=1`); `src/features.py::FEATURE_COLUMNS` (`src/features.py::FEATURE_COLUMNS`) | float32 | fuzzy scores on name_norm (`nn_*`), name_core (`nc_*`), addr_norm (`ad_*`): ratio/partial/tsort/tset/jw in [0,1]; `name_jaccard`, `core_exact`, `name_len_diff`, `addr_empty_s1/cand`, `num_shared`, `num_conflict`, `pc_state` (1 match / 0 missing / -1 conflict); blocking: `cand_is_s3`, `ch_*` (incl. `ch_dup`), `n_channels`, `rank_*` (incl. `rank_dup`), `cos_*`, `block_score` |
+| 37 feature columns by default; + `ch/rank/cos_phon` and `ch/rank_key` when those channels are on, + `ph_*`/`sk_*` (`ER_FEAT_PHON`, on by default), + `house_state`, `num_near`, `core_freq_*`, `name_idf_*`, `s1_*` context (`ER_FEAT_V2`, on by default); 55 columns by default; `src/features.py::FEATURE_COLUMNS` (`src/features.py::FEATURE_COLUMNS`) | float32 | fuzzy scores on name_norm (`nn_*`), name_core (`nc_*`), addr_norm (`ad_*`): ratio/partial/tsort/tset/jw in [0,1]; `name_jaccard`, `core_exact`, `name_len_diff`, `addr_empty_s1/cand`, `num_shared`, `num_conflict`, `pc_state` (1 match / 0 missing / -1 conflict); blocking: `cand_is_s3`, `ch_*` (incl. `ch_dup`), `n_channels`, `rank_*` (incl. `rank_dup`), `cos_*`, `block_score` |
 | `label` | int8 (0/1) | train/val only; absent for test |
 
 ## 4. train/predict -> `data/interim/preds_{split}.parquet`, `model.txt`
