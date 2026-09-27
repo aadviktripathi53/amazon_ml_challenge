@@ -95,9 +95,14 @@ SOURCES = ("S2", "S3")
 
 # Budget model, measured with tracemalloc on the full train data (US partition, name K'=6xK, duplicate-name channel on):
 # a pool shard holds ~217 B/doc/channel of matrices (exact + pruned transposed), x~3 for build transients -> 600;
-# a query costs ~11.4 KB live (both sources' top-K' states + query matrices) and ~19.8 KB at the merge peak -> 20000.
+# a query cost ~11.4 KB live and ~19.8 KB at the merge peak with name/ctx/addr + dup (sum K' = 175 per source, 3 cosine
+# columns): state bytes = 2 sources x sum(K') x (idx 4 + score 4 + 4 per cosine column) = 7,000, x 2.8 = 19.6 KB.
+# ``query_bytes_per_query`` applies that fitted formula to the ACTIVE configuration (e.g. ~29 KB with the phon channel).
 SHARD_BYTES_PER_DOC_PER_CHANNEL = 600
-QUERY_BYTES_PER_QUERY = 20000
+QUERY_PEAK_FACTOR = 2.8
+# Exact cosines are computed PAIR_CHUNK pairs at a time; each chunk materialises 3 sparse matrices, a FIXED transient of
+# ~0.23 GB at 100k pairs (measured ~0.9 GB at the former 400k) that the per-query model above does not include.
+PAIR_CHUNK = int(os.environ.get("ER_PAIR_CHUNK", "100000"))
 SHARD_BUDGET_SHARE = 0.15
 QUERY_BUDGET_SHARE = 0.45  # the rest (~40%) is headroom: IDF vectors, the partition's query frame, pool id arrays, OS
 
@@ -138,6 +143,17 @@ class Budget:
     query_block: int
 
 
+def query_bytes_per_query() -> int:
+    """Peak blocking memory per query for the active channels (formula fitted to the tracemalloc measurement).
+
+    Returns:
+        Bytes per query at the shard-merge peak.
+    """
+    sum_k = sum(retrieve_k(ch) for ch in ACTIVE)
+    state = 2 * sum_k * (4 + 4 + 4 * len(ENABLED))
+    return int(QUERY_PEAK_FACTOR * state)
+
+
 def plan_budget(mem_gb: Optional[float] = None, n_channels: Optional[int] = None) -> Budget:
     """Turn the memory budget into a shard size and a query-block size.
 
@@ -155,7 +171,7 @@ def plan_budget(mem_gb: Optional[float] = None, n_channels: Optional[int] = None
     n_channels = len(ENABLED) if n_channels is None else n_channels
     total = mem_gb * 1024 ** 3
     shard_docs = int(SHARD_BUDGET_SHARE * total / (SHARD_BYTES_PER_DOC_PER_CHANNEL * n_channels))
-    query_block = int(QUERY_BUDGET_SHARE * total / QUERY_BYTES_PER_QUERY)
+    query_block = int(QUERY_BUDGET_SHARE * total / query_bytes_per_query())
     return Budget(shard_docs=int(np.clip(shard_docs, 20_000, 3_000_000)), query_block=int(np.clip(query_block, 20_000, 2_000_000)))
 
 
@@ -695,7 +711,7 @@ def search_shard(block: QueryBlock, shard: Shard, n_jobs: int, chunk_rows: Optio
     return out
 
 
-def search_dup(block: QueryBlock, shard: Shard, pair_chunk: int = 2_000_000) -> Tuple[np.ndarray, np.ndarray]:
+def search_dup(block: QueryBlock, shard: Shard, pair_chunk: int = 0) -> Tuple[np.ndarray, np.ndarray]:
     """Duplicate-name channel for one shard: for queries whose core name is shared by > ``DUP_N`` pool docs, score
     every shard document with EXACTLY the same core name by exact address cosine and keep the top ``K_DUP``.
 
@@ -738,6 +754,7 @@ def _exact_score(block: QueryBlock, shard: Shard, q: np.ndarray, l: np.ndarray, 
     Returns:
         float32 scores.
     """
+    pair_chunk = pair_chunk or PAIR_CHUNK
     s = np.zeros(len(q), np.float32)
     for ch, w in weights.items():
         for lo in range(0, len(q), pair_chunk):
@@ -771,7 +788,7 @@ def _topk_pairs(n: int, q: np.ndarray, l: np.ndarray, s: np.ndarray, k: int) -> 
     return idx, score
 
 
-def search_keys(block: QueryBlock, shard: Shard, pair_chunk: int = 2_000_000) -> Tuple[np.ndarray, np.ndarray]:
+def search_keys(block: QueryBlock, shard: Shard, pair_chunk: int = 0) -> Tuple[np.ndarray, np.ndarray]:
     """Exact-key channel for one shard: pool rows sharing a (country, postcode, house number / first name token) key
     with the query (keys shared by at most ``KEY_MAX`` pool docs), ranked by exact name cosine + 0.5 x address cosine.
 
@@ -794,7 +811,7 @@ def search_keys(block: QueryBlock, shard: Shard, pair_chunk: int = 2_000_000) ->
     return _topk_pairs(n, q, l, s, K_KEY)
 
 
-def merge_shard_result(state: TopK, new_idx: np.ndarray, new_score: np.ndarray, shard: Shard, block: QueryBlock, pair_chunk: int = 400_000) -> TopK:
+def merge_shard_result(state: TopK, new_idx: np.ndarray, new_score: np.ndarray, shard: Shard, block: QueryBlock, pair_chunk: Optional[int] = None) -> TopK:
     """Merge one shard's top-K into the running global top-K and compute exact cosines for the new entries.
 
     Old entries come first in the stable sort, so ties keep the earlier (lower-index) document: the merged result equals
@@ -806,11 +823,12 @@ def merge_shard_result(state: TopK, new_idx: np.ndarray, new_score: np.ndarray, 
         new_score: Scores ``(n, K)`` (-1 empty).
         shard: The shard (for its offset and exact matrices).
         block: Query block (for the exact query matrices).
-        pair_chunk: Pairs per exact-cosine computation (bounds temporary memory).
+        pair_chunk: Pairs per exact-cosine computation (defaults to ``PAIR_CHUNK``; bounds temporary memory).
 
     Returns:
         The merged ``TopK`` (fresh arrays).
     """
+    pair_chunk = pair_chunk or PAIR_CHUNK
     k = state.idx.shape[1]
     glob = np.where(new_idx >= 0, new_idx + shard.offset, -1).astype(np.int32)
     all_idx = np.concatenate([state.idx, glob], axis=1)

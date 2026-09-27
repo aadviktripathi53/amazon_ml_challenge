@@ -44,6 +44,8 @@ so it never needs to fit in memory.
 | `postcode` | str | last 5-6 digit run of the address, else `""` |
 | `city_token` | str | best-effort city component (see `src/normalize.py::city_token`), else `""` |
 | `name_tokens` | list[str] | `name_core.split()` |
+| `name_phon` | str | phonetic key of `name_core` (ph->f, kh->k, bh->b, sh->s, aa->a, ee->i, oo->u, w->v, z->j, collapsed doubles, romanized legal residue dropped) |
+| `name_skel` | str | consonant skeleton of `name_phon` (vowels removed) |
 
 `name_type` / `name_legal` from the first draft of this contract are not produced in baseline v0.
 
@@ -59,6 +61,8 @@ partition, S1 chunk); a row group never splits an S1's candidates. `val` S1s are
 | `country` | str | partition label (= S1 country; `"*"` semantics not used, the S1's own label is written) |
 | `ch_name`, `ch_ctx`, `ch_addr` | bool | pair found by that channel (name_core / name_core+postcode+city / addr_norm) |
 | `rank_name`, `rank_ctx`, `rank_addr` | float32 | rank (1 = best) within that channel and source; NaN if not found by it |
+| `ch_phon`, `rank_phon`, `cos_phon` | bool, float32, float32 | phonetic channel (`ER_CH_PHON=1`; all-False/NaN when off) |
+| `ch_key`, `rank_key` | bool, float32 | exact-key channel (`ER_CH_KEY=1`): (country, postcode, first house number) + (country, postcode, first core token), keys shared by > `ER_KEY_MAX` (50) pool docs skipped, top `ER_K_KEY` (5) per source by exact name cos + 0.5 x addr cos |
 | `ch_dup`, `rank_dup` | bool, float32 | duplicate-name channel: query core name shared by > `ER_DUP_N` (20) pool docs -> top `ER_K_DUP` (5) per source of the SAME core name by exact address cosine |
 | `cos_name`, `cos_ctx`, `cos_addr` | float32 | EXACT char-3-gram TF-IDF cosine of the pair on that channel (for every union pair) |
 | `block_score` | float32 | max of the exact cosines |
@@ -87,7 +91,7 @@ Same rows and order as `candidates_{split}.parquet`.
 | Column | Type | Notes |
 |---|---|---|
 | `s1_id`, `cand_id` | str | |
-| 37 feature columns (`src/features.py::FEATURE_COLUMNS`) | float32 | fuzzy scores on name_norm (`nn_*`), name_core (`nc_*`), addr_norm (`ad_*`): ratio/partial/tsort/tset/jw in [0,1]; `name_jaccard`, `core_exact`, `name_len_diff`, `addr_empty_s1/cand`, `num_shared`, `num_conflict`, `pc_state` (1 match / 0 missing / -1 conflict); blocking: `cand_is_s3`, `ch_*` (incl. `ch_dup`), `n_channels`, `rank_*` (incl. `rank_dup`), `cos_*`, `block_score` |
+| 37 feature columns by default; + `ch/rank/cos_phon` and `ch/rank_key` when those channels are on, + `ph_*`/`sk_*` (`ER_FEAT_PHON=1`), + `house_state`, `num_near`, `core_freq_*`, `name_idf_*`, `s1_*` context (`ER_FEAT_V2=1`); `src/features.py::FEATURE_COLUMNS` (`src/features.py::FEATURE_COLUMNS`) | float32 | fuzzy scores on name_norm (`nn_*`), name_core (`nc_*`), addr_norm (`ad_*`): ratio/partial/tsort/tset/jw in [0,1]; `name_jaccard`, `core_exact`, `name_len_diff`, `addr_empty_s1/cand`, `num_shared`, `num_conflict`, `pc_state` (1 match / 0 missing / -1 conflict); blocking: `cand_is_s3`, `ch_*` (incl. `ch_dup`), `n_channels`, `rank_*` (incl. `rank_dup`), `cos_*`, `block_score` |
 | `label` | int8 (0/1) | train/val only; absent for test |
 
 ## 4. train/predict -> `data/interim/preds_{split}.parquet`, `model.txt`

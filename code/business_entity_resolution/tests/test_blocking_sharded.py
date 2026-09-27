@@ -290,6 +290,8 @@ def test_query_block_fits_the_measured_budget():
     """With the default 8 GB budget the planned query block and shard stay within their shares of the budget."""
     b = B.plan_budget(8, 3)
     budget = 8 * 1024 ** 3
-    assert b.query_block * B.QUERY_BYTES_PER_QUERY <= B.QUERY_BUDGET_SHARE * budget + B.QUERY_BYTES_PER_QUERY
+    per_query = B.query_bytes_per_query()
+    assert 15_000 < per_query < 25_000  # default config: matches the ~19.8 KB measured on the full data
+    assert b.query_block * per_query <= B.QUERY_BUDGET_SHARE * budget + per_query
     assert b.shard_docs * 3 * B.SHARD_BYTES_PER_DOC_PER_CHANNEL <= B.SHARD_BUDGET_SHARE * budget + 3 * B.SHARD_BYTES_PER_DOC_PER_CHANNEL
     assert B.SHARD_BUDGET_SHARE + B.QUERY_BUDGET_SHARE <= 0.65  # leave headroom

@@ -15,13 +15,31 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .cli import parse_split
-from .config import ensure_dirs
+from .config import ensure_dirs, max_mem_gb
 from .features import FEATURE_COLUMNS, features_path
 from .perf import stage_timer
 from .train import MODEL_PATH, preds_path
 
-BATCH_ROWS = 1_000_000
+BATCH_ROWS = 1_000_000  # upper bound; see batch_rows()
+BATCH_BUDGET_SHARE = 0.1  # share of ER_MAX_MEM_GB for one scoring batch
+BYTES_PER_CELL = 12  # arrow + pandas + float32 matrix copies of one feature value
+
 PRED_SCHEMA = pa.schema([("s1_id", pa.string()), ("cand_id", pa.string()), ("prob", pa.float32())])
+
+
+def batch_rows(n_features: int, mem_gb: Optional[float] = None) -> int:
+    """Rows scored per batch: ``BATCH_BUDGET_SHARE`` of the memory budget / (features x copies), at most ``BATCH_ROWS``.
+
+    Args:
+        n_features: Number of feature columns.
+        mem_gb: Budget in GB (defaults to ``config.max_mem_gb()``).
+
+    Returns:
+        Batch size in rows (>= 10,000).
+    """
+    mem_gb = max_mem_gb() if mem_gb is None else mem_gb
+    rows = int(BATCH_BUDGET_SHARE * mem_gb * 1024 ** 3 / (max(n_features, 1) * BYTES_PER_CELL))
+    return max(10_000, min(BATCH_ROWS, rows))
 
 
 def predict_split(split: str) -> int:
@@ -39,7 +57,7 @@ def predict_split(split: str) -> int:
     ensure_dirs()
     n = 0
     with pq.ParquetWriter(preds_path(split), PRED_SCHEMA, compression="zstd") as writer:
-        for batch in pq.ParquetFile(features_path(split)).iter_batches(batch_size=BATCH_ROWS, columns=["s1_id", "cand_id", *FEATURE_COLUMNS]):
+        for batch in pq.ParquetFile(features_path(split)).iter_batches(batch_size=batch_rows(len(FEATURE_COLUMNS)), columns=["s1_id", "cand_id", *FEATURE_COLUMNS]):
             df = batch.to_pandas()
             prob = booster.predict(df[FEATURE_COLUMNS].to_numpy(dtype=np.float32))
             writer.write_table(pa.table({"s1_id": df["s1_id"], "cand_id": df["cand_id"], "prob": prob.astype(np.float32)}, schema=PRED_SCHEMA))

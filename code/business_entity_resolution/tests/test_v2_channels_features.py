@@ -147,3 +147,10 @@ def test_v2_and_phonetic_features():
     ph = F.phonetic_features(pd.DataFrame({"name_phon": ["sri kana bavan"], "name_skel": ["sr kn bvn"]}),
                              pd.DataFrame({"name_phon": ["sri kana bavan"], "name_skel": ["sr kn bvn"]}))
     assert ph["sk_exact"][0] == 1 and ph["ph_ratio"][0] == 1
+
+
+def test_query_memory_model_grows_with_the_phonetic_channel(monkeypatch):
+    """Turning on the phonetic channel raises the per-query estimate (4 channels, more K') and shrinks query blocks."""
+    base, block_base = B.query_bytes_per_query(), B.plan_budget(8).query_block
+    _set_channels(monkeypatch, phon=True)
+    assert B.query_bytes_per_query() > 1.3 * base and B.plan_budget(8).query_block < block_base
