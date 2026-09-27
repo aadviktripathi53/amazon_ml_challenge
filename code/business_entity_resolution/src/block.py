@@ -60,27 +60,37 @@ from .tfidf import (
 K_NAME = 15  # top-K per source on the name channel
 K_CTX = 10  # top-K per source on the name+postcode+city channel
 K_ADDR = 10  # top-K per source on the address channel (recovers pairs whose NAMES differ: scripts, DBA names)
-CHANNELS: Dict[str, int] = {"name": K_NAME, "ctx": K_CTX, "addr": K_ADDR}
-ENABLED = [c for c in os.environ.get("ER_CHANNELS", "name,ctx,addr").split(",") if c in CHANNELS]
+K_PHON = 10  # top-K per source on the phonetic channel (trigrams of the phonetic key of name_core)
+CHANNELS: Dict[str, int] = {"name": K_NAME, "ctx": K_CTX, "addr": K_ADDR, "phon": K_PHON}
+CH_PHON = os.environ.get("ER_CH_PHON", "0") == "1"  # phonetic blocking channel (off by default)
+ENABLED = [c for c in os.environ.get("ER_CHANNELS", "name,ctx,addr").split(",") if c in CHANNELS and c != "phon"]
+if CH_PHON:
+    ENABLED.append("phon")
+# Exact-key channel: (country, postcode, first house number) and (country, postcode, first core-name token); keys
+# shared by more than KEY_MAX pool docs are skipped; top K_KEY per source by exact name cosine + 0.5 x address cosine.
+CH_KEY = os.environ.get("ER_CH_KEY", "0") == "1"
+KEY_MAX = int(os.environ.get("ER_KEY_MAX", "50"))
+K_KEY = int(os.environ.get("ER_K_KEY", "5"))
 CHUNK_ROWS = int(os.environ.get("ER_BLOCK_CHUNK", "1000"))  # S1 queries per sparse product
 EMIT_ROWS = 2000  # S1 queries per written Parquet row group
 BATCH_ROWS = 100_000  # rows per streamed record batch
 MAX_DF_FRAC = 0.002  # n-gram pruned from the SEARCH matrices when in > this share of the partition's documents ...
 MAX_DF_FLOOR = 500  # ... but never below this many documents
 RARE_FALLBACK_N = int(os.environ.get("ER_RARE_FALLBACK_N", "5"))  # rarest n-grams a zero-survivor query row gets back (0 = off)
-RARE_FALLBACK_CHANNELS = ("name", "ctx", "addr")  # channels the fallback applies to
+RARE_FALLBACK_CHANNELS = ("name", "ctx", "addr", "phon")  # channels the fallback applies to
 RETRIEVE_MULT = int(os.environ.get("ER_RETRIEVE_MULT", "4"))  # K' = RETRIEVE_MULT x K retrieved by pruned score, reranked to K
 RETRIEVE_MULT_BY_CHANNEL = {"name": int(os.environ.get("ER_RETRIEVE_MULT_NAME") or 6)}  # per-channel override (name: 6 x K)
 DUP_N = int(os.environ.get("ER_DUP_N", "20"))  # duplicate-name channel: query core names shared by > DUP_N pool docs (0 = off)
 K_DUP = int(os.environ.get("ER_K_DUP", "5"))  # per source, ranked by exact address cosine within the same-name cluster
 DUP_ON = DUP_N > 0 and "addr" in ENABLED
-ACTIVE = ENABLED + (["dup"] if DUP_ON else [])  # channels that produce top-K states
-RANK_CHANNELS = [*CHANNELS, "dup"]  # channels with a flag + rank column in the candidate file
+KEY_ON = CH_KEY and "addr" in ENABLED and "name" in ENABLED
+ACTIVE = ENABLED + (["dup"] if DUP_ON else []) + (["key"] if KEY_ON else [])  # channels that produce top-K states
+RANK_CHANNELS = [*CHANNELS, "dup", "key"]  # channels with a flag + rank column in the candidate file
 ADDR_TIEBREAK_WEIGHT = float(os.environ.get("ER_ADDR_TIEBREAK_W", "0.5"))  # name/ctx rerank key = exact cos + w x exact addr cos
-ADDR_TIEBREAK_CHANNELS = ("name", "ctx")
+ADDR_TIEBREAK_CHANNELS = ("name", "ctx", "phon")
 COUNTRY_EQUAL_MIN = 0.995
 META_PATH = INTERIM_DIR / "block_meta.json"
-TEXT_COLUMNS = ["name_core", "postcode", "city_token", "addr_norm"]
+TEXT_COLUMNS = ["name_core", "postcode", "city_token", "addr_norm"] + (["name_phon"] if CH_PHON else []) + (["numbers"] if CH_KEY else [])
 SOURCES = ("S2", "S3")
 
 # Budget model, measured with tracemalloc on the full train data (US partition, name K'=6xK, duplicate-name channel on):
@@ -95,7 +105,9 @@ CANDIDATE_SCHEMA = pa.schema(
     [
         ("s1_id", pa.string()), ("cand_id", pa.string()), ("country", pa.string()), ("ch_name", pa.bool_()),
         ("ch_ctx", pa.bool_()), ("ch_addr", pa.bool_()), ("rank_name", pa.float32()), ("rank_ctx", pa.float32()),
-        ("rank_addr", pa.float32()), ("ch_dup", pa.bool_()), ("rank_dup", pa.float32()), ("cos_name", pa.float32()), ("cos_ctx", pa.float32()), ("cos_addr", pa.float32()),
+        ("rank_addr", pa.float32()), ("ch_dup", pa.bool_()), ("rank_dup", pa.float32()), ("ch_phon", pa.bool_()),
+        ("rank_phon", pa.float32()), ("ch_key", pa.bool_()), ("rank_key", pa.float32()), ("cos_name", pa.float32()),
+        ("cos_ctx", pa.float32()), ("cos_addr", pa.float32()), ("cos_phon", pa.float32()),
         ("block_score", pa.float32()),
     ]
 )
@@ -163,7 +175,7 @@ def blocking_config() -> Dict[str, object]:
         "retrieve_mult_by_channel": dict(RETRIEVE_MULT_BY_CHANNEL), "addr_tiebreak_weight": ADDR_TIEBREAK_WEIGHT,
         "rare_fallback_n": RARE_FALLBACK_N, "rare_fallback_channels": list(RARE_FALLBACK_CHANNELS),
         "dup_n": DUP_N if DUP_ON else 0, "k_dup": K_DUP, "max_df_frac": MAX_DF_FRAC, "max_df_floor": MAX_DF_FLOOR,
-        "romanize": ROMANIZE,
+        "romanize": ROMANIZE, "key_channel": [KEY_MAX, K_KEY] if KEY_ON else None,
     }
 
 
@@ -286,6 +298,8 @@ def channel_text(frame: pd.DataFrame, channel: str) -> pd.Series:
         return frame["name_core"]
     if channel == "ctx":
         return (frame["name_core"] + " " + frame["postcode"] + " " + frame["city_token"]).str.strip()
+    if channel == "phon":
+        return frame["name_phon"]
     return frame["addr_norm"]
 
 
@@ -320,6 +334,39 @@ class Idf:
     max_df: int
     n_pool: Dict[str, int]
     dup_hashes: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
+    key_hashes: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
+
+
+def record_keys(frame: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """Exact blocking keys of records: (country, postcode, first house number) and (country, postcode, first name token).
+
+    Only records with a postcode get keys. The first house number is the first digit run of the address that is not the
+    postcode itself (leading zeros stripped).
+
+    Args:
+        frame: Records with ``country`` (optional), ``postcode``, ``numbers`` and ``name_core``.
+
+    Returns:
+        ``(row index array, uint64 key hash array)``; a row can appear up to twice.
+    """
+    rows, keys = [], []
+    country = frame["country"].to_numpy(dtype=object) if "country" in frame else np.full(len(frame), "", dtype=object)
+    postcode = frame["postcode"].to_numpy(dtype=object)
+    names = frame["name_core"].to_numpy(dtype=object)
+    numbers = frame["numbers"].tolist()
+    for i in np.flatnonzero(postcode != ""):
+        pc = postcode[i]
+        house = next(((n.lstrip("0") or "0") for n in (numbers[i] if numbers[i] is not None else []) if n != pc), None)
+        if house is not None:
+            rows.append(i)
+            keys.append(f"{country[i]}|{pc}|n|{house}")
+        tok = names[i].split(" ", 1)[0] if names[i] else ""
+        if tok:
+            rows.append(i)
+            keys.append(f"{country[i]}|{pc}|t|{tok}")
+    if not rows:
+        return np.zeros(0, np.int64), np.zeros(0, np.uint64)
+    return np.asarray(rows, np.int64), pd.util.hash_array(np.asarray(keys, dtype=object), categorize=False)
 
 
 def name_hash(names: pd.Series) -> np.ndarray:
@@ -351,7 +398,8 @@ def fit_idf(path, country: Optional[str]) -> Idf:
     n_pool = {s: 0 for s in SOURCES}
     n_docs = 0
     pool_hashes: List[np.ndarray] = []
-    columns = ["source", *TEXT_COLUMNS]
+    pool_keys: List[np.ndarray] = []
+    columns = ["source", *TEXT_COLUMNS] + (["country"] if KEY_ON else [])
     for batch in iter_partition_batches(path, country, ("S1", "S2", "S3"), columns):
         frame = to_frame(batch)
         n_docs += len(frame)
@@ -361,12 +409,19 @@ def fit_idf(path, country: Optional[str]) -> Idf:
             df[ch] += document_frequency(hashed_counts(channel_text(frame, ch)))
         if DUP_ON:
             pool_hashes.append(name_hash(frame.loc[(frame["source"] != "S1").to_numpy(), "name_core"]))
+        if KEY_ON:
+            pool_keys.append(record_keys(frame[(frame["source"] != "S1").to_numpy()].reset_index(drop=True))[1])
+    key_hashes = np.zeros(0, np.uint64)
+    if KEY_ON and pool_keys:  # keys usable for blocking: shared by 1..KEY_MAX pool docs
+        values, counts = np.unique(np.concatenate(pool_keys), return_counts=True)
+        key_hashes = values[counts <= KEY_MAX]
     dup_hashes = np.zeros(0, np.uint64)
     if DUP_ON and pool_hashes:
         values, counts = np.unique(np.concatenate(pool_hashes), return_counts=True)
         dup_hashes = values[(counts > DUP_N) & (values != 0)]
     return Idf(df=df, idf={ch: idf_vector(df[ch], n_docs) for ch in ENABLED}, n_docs=n_docs,
-               max_df=max(MAX_DF_FLOOR, int(MAX_DF_FRAC * n_docs)), n_pool=n_pool, dup_hashes=dup_hashes)
+               max_df=max(MAX_DF_FLOOR, int(MAX_DF_FRAC * n_docs)), n_pool=n_pool, dup_hashes=dup_hashes,
+               key_hashes=key_hashes)
 
 
 @dataclass
@@ -393,6 +448,8 @@ class QueryBlock:
     n_fallback: Dict[str, int] = field(default_factory=dict)
     name_hash: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
     dup_mask: np.ndarray = field(default_factory=lambda: np.zeros(0, bool))
+    key_rows: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    key_hash: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
 
 
 def build_query_block(frame: pd.DataFrame, split_code: np.ndarray, idf: Idf) -> QueryBlock:
@@ -417,6 +474,10 @@ def build_query_block(frame: pd.DataFrame, split_code: np.ndarray, idf: Idf) -> 
     if DUP_ON:
         block.name_hash = name_hash(frame["name_core"])
         block.dup_mask = isin_sorted(block.name_hash, idf.dup_hashes)
+    if KEY_ON:
+        rows, keys = record_keys(frame)
+        ok = isin_sorted(keys, idf.key_hashes)
+        block.key_rows, block.key_hash = rows[ok], keys[ok]
     return block
 
 
@@ -437,6 +498,8 @@ class Shard:
     exact: Dict[str, sp.csr_matrix]
     search_t: Dict[str, sp.csr_matrix]
     name_hash: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
+    key_rows: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    key_hash: np.ndarray = field(default_factory=lambda: np.zeros(0, np.uint64))
 
 
 def iter_shards(path, country: Optional[str], source: str, shard_docs: int, idf: Idf, exempt: Optional[Dict[str, np.ndarray]] = None) -> Iterator[Shard]:
@@ -457,27 +520,34 @@ def iter_shards(path, country: Optional[str], source: str, shard_docs: int, idf:
     parts: Dict[str, List[sp.csr_matrix]] = {ch: [] for ch in ENABLED}
     ids: List[pa.Array] = []
     hashes: List[np.ndarray] = []
+    key_parts: List[Tuple[np.ndarray, np.ndarray]] = []
     n = offset = 0
 
     def close() -> Shard:
         """Assemble the shard from the accumulated batches."""
         exact = {ch: sp.vstack(parts[ch], format="csr", dtype=np.float32) if len(parts[ch]) > 1 else parts[ch][0] for ch in ENABLED}
         search_t = {ch: prune_common(exact[ch], idf.df[ch], idf.max_df, (exempt or {}).get(ch)).T.tocsr() for ch in ENABLED}
+        rows = np.concatenate([r for r, _ in key_parts]) if key_parts else np.zeros(0, np.int64)
+        khash = np.concatenate([k for _, k in key_parts]) if key_parts else np.zeros(0, np.uint64)
         return Shard(ids=pa.concat_arrays(ids), offset=offset, exact=exact, search_t=search_t,
-                     name_hash=np.concatenate(hashes) if hashes else np.zeros(0, np.uint64))
+                     name_hash=np.concatenate(hashes) if hashes else np.zeros(0, np.uint64), key_rows=rows, key_hash=khash)
 
-    for batch in iter_partition_batches(path, country, (source,), ["entity_id", "source", *TEXT_COLUMNS]):
+    for batch in iter_partition_batches(path, country, (source,), ["entity_id", "source", *TEXT_COLUMNS] + (["country"] if KEY_ON else [])):
         frame = to_frame(batch)
         for ch in ENABLED:
             parts[ch].append(tfidf_weight(hashed_counts(channel_text(frame, ch)), idf.idf[ch]))
         ids.append(batch.column("entity_id").cast(pa.string()))
         if DUP_ON:
             hashes.append(name_hash(frame["name_core"]))
+        if KEY_ON:
+            rows, keys = record_keys(frame)
+            ok = isin_sorted(keys, idf.key_hashes)
+            key_parts.append((rows[ok] + n, keys[ok]))  # shard-local row index
         n += len(frame)
         if n >= shard_docs:
             yield close()
             offset += n
-            parts, ids, hashes, n = {ch: [] for ch in ENABLED}, [], [], 0
+            parts, ids, hashes, key_parts, n = {ch: [] for ch in ENABLED}, [], [], [], 0
     if n:
         yield close()
 
@@ -506,7 +576,7 @@ def final_k(channel: str) -> int:
     Returns:
         K.
     """
-    return K_DUP if channel == "dup" else CHANNELS[channel]
+    return {"dup": K_DUP, "key": K_KEY}.get(channel) or CHANNELS[channel]
 
 
 def retrieve_k(channel: str) -> int:
@@ -521,8 +591,8 @@ def retrieve_k(channel: str) -> int:
     Returns:
         K'.
     """
-    if channel == "dup":
-        return K_DUP
+    if channel in ("dup", "key"):
+        return final_k(channel)
     return RETRIEVE_MULT_BY_CHANNEL.get(channel, RETRIEVE_MULT) * CHANNELS[channel]
 
 
@@ -541,9 +611,9 @@ def rerank_topk(state: TopK, channel: str) -> TopK:
         ``TopK`` with K slots per query, sorted by the rerank key (empty slots, idx -1, last).
     """
     k = final_k(channel)
-    own = "addr" if channel == "dup" else channel  # the duplicate-name channel ranks by address similarity
+    own = {"dup": "addr", "key": "name"}.get(channel, channel)  # dup ranks by address, key by name (+ address tiebreak)
     key = np.nan_to_num(state.cos[:, :, ENABLED.index(own)], nan=0.0).astype(np.float32)
-    if channel in ADDR_TIEBREAK_CHANNELS and "addr" in ENABLED and ADDR_TIEBREAK_WEIGHT:
+    if (channel in ADDR_TIEBREAK_CHANNELS or channel == "key") and "addr" in ENABLED and ADDR_TIEBREAK_WEIGHT:
         key = key + ADDR_TIEBREAK_WEIGHT * np.nan_to_num(state.cos[:, :, ENABLED.index("addr")], nan=0.0)
     key = np.where(state.idx >= 0, key, -np.inf)
     order = np.argsort(-key, axis=1, kind="stable")[:, :k]
@@ -640,27 +710,88 @@ def search_dup(block: QueryBlock, shard: Shard, pair_chunk: int = 2_000_000) -> 
         ``(shard-local idx [n, K_DUP] (-1 empty), score [n, K_DUP] (-1 empty))``.
     """
     n = len(block.ids)
-    idx = np.full((n, K_DUP), -1, np.int32)
-    score = np.full((n, K_DUP), -1.0, np.float32)
+    empty = np.zeros(0, np.int64)
     qm = np.flatnonzero(block.dup_mask)
     if len(qm) == 0:
-        return idx, score
+        return _topk_pairs(n, empty, empty, np.zeros(0, np.float32), K_DUP)
     wanted = np.unique(block.name_hash[qm])
     sel = np.flatnonzero(isin_sorted(shard.name_hash, wanted))
     if len(sel) == 0:
-        return idx, score
+        return _topk_pairs(n, empty, empty, np.zeros(0, np.float32), K_DUP)
     pairs = pd.DataFrame({"h": block.name_hash[qm], "q": qm}).merge(pd.DataFrame({"h": shard.name_hash[sel], "l": sel}), on="h")
     q, l = pairs["q"].to_numpy(np.int64), pairs["l"].to_numpy(np.int64)
-    s = np.empty(len(q), np.float32)
-    for lo in range(0, len(q), pair_chunk):
-        s[lo : lo + pair_chunk] = pair_cosine(block.exact["addr"], q[lo : lo + pair_chunk], shard.exact["addr"], l[lo : lo + pair_chunk])
+    s = _exact_score(block, shard, q, l, {"addr": 1.0}, pair_chunk)
+    return _topk_pairs(n, q, l, s, K_DUP)
+
+
+def _exact_score(block: QueryBlock, shard: Shard, q: np.ndarray, l: np.ndarray, weights: Dict[str, float], pair_chunk: int) -> np.ndarray:
+    """Weighted sum of exact channel cosines for (query row, shard row) pairs, computed in chunks.
+
+    Args:
+        block: Query block.
+        shard: Pool shard.
+        q: Query rows.
+        l: Shard-local rows.
+        weights: ``{channel: weight}``.
+        pair_chunk: Pairs per cosine computation.
+
+    Returns:
+        float32 scores.
+    """
+    s = np.zeros(len(q), np.float32)
+    for ch, w in weights.items():
+        for lo in range(0, len(q), pair_chunk):
+            s[lo : lo + pair_chunk] += w * pair_cosine(block.exact[ch], q[lo : lo + pair_chunk], shard.exact[ch], l[lo : lo + pair_chunk])
+    return s
+
+
+def _topk_pairs(n: int, q: np.ndarray, l: np.ndarray, s: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Top-k shard rows per query from scored pairs (ties: lower shard row), as ``(idx, score)`` ``(n, k)`` arrays.
+
+    Args:
+        n: Number of queries in the block.
+        q: Query row per pair.
+        l: Shard-local row per pair.
+        s: Score per pair.
+        k: Slots per query.
+
+    Returns:
+        ``(idx [n, k] (-1 empty), score [n, k] (-1 empty))``.
+    """
+    idx = np.full((n, k), -1, np.int32)
+    score = np.full((n, k), -1.0, np.float32)
+    if len(q) == 0:
+        return idx, score
     order = np.lexsort((l, -s, q))
     q, l, s = q[order], l[order], s[order]
     rank = np.arange(len(q)) - np.searchsorted(q, q, side="left")
-    keep = rank < K_DUP
+    keep = rank < k
     idx[q[keep], rank[keep]] = l[keep]
     score[q[keep], rank[keep]] = s[keep]
     return idx, score
+
+
+def search_keys(block: QueryBlock, shard: Shard, pair_chunk: int = 2_000_000) -> Tuple[np.ndarray, np.ndarray]:
+    """Exact-key channel for one shard: pool rows sharing a (country, postcode, house number / first name token) key
+    with the query (keys shared by at most ``KEY_MAX`` pool docs), ranked by exact name cosine + 0.5 x address cosine.
+
+    Args:
+        block: Query block (with ``key_rows``/``key_hash``).
+        shard: Pool shard (with ``key_rows``/``key_hash``).
+        pair_chunk: Pairs per cosine computation.
+
+    Returns:
+        ``(shard-local idx [n, K_KEY], score [n, K_KEY])``, -1 = empty.
+    """
+    n = len(block.ids)
+    empty = np.zeros(0, np.int64)
+    if len(block.key_hash) == 0 or len(shard.key_hash) == 0:
+        return _topk_pairs(n, empty, empty, np.zeros(0, np.float32), K_KEY)
+    pairs = pd.DataFrame({"h": block.key_hash, "q": block.key_rows}).merge(pd.DataFrame({"h": shard.key_hash, "l": shard.key_rows}), on="h")
+    pairs = pairs.drop_duplicates(["q", "l"])  # both keys may link the same pair
+    q, l = pairs["q"].to_numpy(np.int64), pairs["l"].to_numpy(np.int64)
+    s = _exact_score(block, shard, q, l, {"name": 1.0, "addr": ADDR_TIEBREAK_WEIGHT}, pair_chunk)
+    return _topk_pairs(n, q, l, s, K_KEY)
 
 
 def merge_shard_result(state: TopK, new_idx: np.ndarray, new_score: np.ndarray, shard: Shard, block: QueryBlock, pair_chunk: int = 400_000) -> TopK:
@@ -774,6 +905,9 @@ def block_query_block(path, country: Optional[str], block: QueryBlock, idf: Idf,
             if DUP_ON:
                 d_idx, d_score = search_dup(block, shard)
                 states[("dup", src)] = merge_shard_result(states[("dup", src)], d_idx, d_score, shard, block)
+            if KEY_ON:
+                k_idx, k_score = search_keys(block, shard)
+                states[("key", src)] = merge_shard_result(states[("key", src)], k_idx, k_score, shard, block)
             pool_ids[src].append(shard.ids)
             print(f"block: {label} {src} shard {i} ({len(shard.ids)} docs, offset {shard.offset}) searched by {n} queries in "
                   f"{time.perf_counter() - t0:.1f}s, peak RSS {peak_rss_mb():.0f} MB", flush=True)

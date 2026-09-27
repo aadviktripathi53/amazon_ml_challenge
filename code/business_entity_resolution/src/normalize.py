@@ -39,7 +39,7 @@ _REPEATED_LETTER = re.compile(r"([a-z])\1+")
 # mapped to their English form so the normal legal-suffix stripping applies. Only applied to romanized tokens, so a Latin
 # name like "Li Wei" keeps its "li".
 ROMANIZED_LEGAL = {
-    **dict.fromkeys("praivet praibhet piraivet praivr privet pra".split(), "private"),
+    **dict.fromkeys("praivet praibhet praibet piraivet praivr privet pra".split(), "private"),
     **dict.fromkeys("limited limitet limird limtid limitd li".split(), "limited"),
     "elelpi": "llp", "kmpni": "company", "kampani": "company",
 }
@@ -67,6 +67,11 @@ NON_CITY_WORDS: FrozenSet[str] = frozenset(
     "appartement batiment bat zone lieu passage villa hameau".split()
 )
 
+# Phonetic key of name_core (language-agnostic transliteration equivalents; see ``phonetic_key``). Applied in order,
+# then repeated letters are collapsed.
+PHONETIC_RULES = (("ph", "f"), ("kh", "k"), ("bh", "b"), ("sh", "s"), ("aa", "a"), ("ee", "i"), ("oo", "u"), ("w", "v"), ("z", "j"))
+_VOWELS = re.compile(r"[aeiouy]")
+
 _DROP_INSIDE = re.compile(r"[.'`]")  # deleted without a space: "S.G." -> "sg", "Joe's" -> "joes"
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _DIGIT_RUN = re.compile(r"\d+")
@@ -74,14 +79,15 @@ POSTCODE_LENGTHS = (5, 6)  # US/France zip = 5 digits, India PIN = 6 digits
 
 OUT_COLUMNS = [
     "entity_id", "source", "country", "name_raw", "addr_raw", "name_norm", "name_core", "addr_norm",
-    "numbers", "postcode", "city_token", "name_tokens",
+    "numbers", "postcode", "city_token", "name_tokens", "name_phon", "name_skel",
 ]
 RECORD_SCHEMA = pa.schema(
     [
         ("entity_id", pa.string()), ("source", pa.string()), ("country", pa.string()), ("name_raw", pa.string()),
         ("addr_raw", pa.string()), ("name_norm", pa.string()), ("name_core", pa.string()),
         ("addr_norm", pa.string()), ("numbers", pa.list_(pa.string())), ("postcode", pa.string()),
-        ("city_token", pa.string()), ("name_tokens", pa.list_(pa.string())),
+        ("city_token", pa.string()), ("name_tokens", pa.list_(pa.string())), ("name_phon", pa.string()),
+        ("name_skel", pa.string()),
     ]
 )
 
@@ -263,6 +269,44 @@ def city_token(raw_address: str) -> str:
     return kept[-2] if len(kept) >= 2 else kept[0]
 
 
+def phonetic_key(core: str) -> str:
+    """Phonetic key of a (normalised, ASCII) core name.
+
+    ph->f, kh->k, bh->b, sh->s, aa->a, ee->i, oo->u, w->v, z->j, then repeated letters are collapsed; tokens that are
+    legal forms after this mapping (e.g. the romanized 'praivet', 'limited') are dropped, like in ``name_core``.
+    ``"phyuucr phaaunddeshn"`` -> ``"fyucr faundesn"``.
+
+    Args:
+        core: ``name_core``.
+
+    Returns:
+        Space-separated phonetic tokens (``""`` for an empty name).
+    """
+    out = []
+    for tok in core.split():
+        for a, b in PHONETIC_RULES:
+            tok = tok.replace(a, b)
+        tok = _REPEATED_LETTER.sub(r"\1", tok)
+        tok = ROMANIZED_LEGAL.get(tok, tok)
+        if tok and tok not in CORE_STOPWORDS:
+            out.append(tok)
+    return " ".join(out)
+
+
+def consonant_skeleton(phon: str) -> str:
+    """Consonant skeleton of a phonetic key: vowels (and y) removed per token, empty tokens dropped.
+
+    ``"istarn raj global"`` and ``"eastern raj global"`` both give ``"strn rj glbl"``.
+
+    Args:
+        phon: Output of ``phonetic_key``.
+
+    Returns:
+        Space-separated skeleton tokens.
+    """
+    return " ".join(t for t in (_VOWELS.sub("", tok) for tok in phon.split()) if t)
+
+
 def normalize_record(entity_id: str, name: str, address: str, country: str) -> Tuple:
     """Normalise one record into the ``OUT_COLUMNS`` tuple.
 
@@ -279,9 +323,10 @@ def normalize_record(entity_id: str, name: str, address: str, country: str) -> T
     name_norm = normalize_name(name)
     core = name_core(name_norm)
     numbers = digit_runs(address)
+    phon = phonetic_key(core)
     return (
         entity_id, entity_id[:2], country.strip(), name, address, name_norm, core, normalize_address(address),
-        numbers, extract_postcode(numbers), city_token(address), core.split(),
+        numbers, extract_postcode(numbers), city_token(address), core.split(), phon, consonant_skeleton(phon),
     )
 
 
